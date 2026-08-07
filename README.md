@@ -516,9 +516,37 @@ Steam's handle can leave queued zombie-controller cleanup: the second request,
 issued ~2.2 s later, makes the post-cleanup state durable. The payload issues it
 on a shared timer thread rather than making the caller wait.
 
-If the layout cannot be proven, the payload falls back to a Steam-window
-device-change notification plus `SDL_UpdateJoysticks` when that export is
-loaded.
+### SDL-backed non-Valve controllers
+
+Steam Controllers and SDL-backed controllers do not fail in the same layer.
+Valve devices are rediscovered directly by Steam's controller I/O thread. For a
+non-Valve device such as a DualSense, an I/O failure can first make SDL HIDAPI
+retain a dead joystick record. In that state raw HID enumeration still sees the
+physical device, but `SDL_GetJoysticks` gives Steam an empty snapshot, so a
+Steam-only discovery request cannot restore it.
+
+On final release the injected payload therefore repairs the layers in order:
+
+1. find Steam's message-only `SDL_HIDAPI_DEVICE_DETECTION` window and verify
+   that its owner is the current Steam process;
+2. synchronously send that window a `WM_DEVICECHANGE` /
+   `DBT_DEVICEARRIVAL` event carrying a `DBT_DEVTYP_DEVICEINTERFACE` header,
+   which advances SDL's HID device-change generation;
+3. resolve the public `SDL_UpdateJoysticks` export from the already loaded
+   `SDL3.dll` and call it twice — the first pass can discard the failed retained
+   record and reset SDL's cached generation, while the second re-enumerates and
+   adds the controller;
+4. run the existing build-independent Steam discovery request, including its
+   delayed second pass.
+
+The message is sent from inside Steam and handled synchronously because its
+`LPARAM` points to process-local stack memory. It is never posted or broadcast
+to arbitrary windows. The SDL bridge uses only a window-class name and an
+exported function name: it contains no SDL RVA, private object offset, PDB
+dependency, or version profile.
+
+If the Steam layout cannot be proven, the payload still performs the SDL bridge
+and then falls back to the non-invasive Steam-window device-change notification.
 
 ## Payload lifetime
 
@@ -549,6 +577,8 @@ safely unloadable one in place.
 - The HID/XInput gate itself does not depend on any Steam offset.
 - Recovery contains no build table and no fixed RVAs, so routine Steam updates
   that move code, vtables, or object fields are re-resolved automatically.
+- SDL-backed controller repair likewise contains no SDL code address; it finds
+  the process-local detection window and resolves `SDL_UpdateJoysticks` by name.
 - A substantial Valve refactor can still break recovery — stripping RTTI,
   renaming or replacing `CHIDIOThread`, changing its inheritance, or rewriting
   the scheduler so the validated instruction semantics disappear.

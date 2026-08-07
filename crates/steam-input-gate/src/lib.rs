@@ -69,13 +69,17 @@ use windows_sys::Win32::System::Threading::{
     CreateThread, GetCurrentProcess, GetCurrentProcessId, SetEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_DEVICECHANGE,
+    EnumWindows, FindWindowExW, GetWindowThreadProcessId, PostMessageW, SendMessageW,
+    WM_DEVICECHANGE,
 };
 
 // Win32/NT constants that windows-sys does not expose through the selected API
 // surface. Values come from the Windows SDK headers used by the archived POC.
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
+const DBT_DEVICEARRIVAL: usize = 0x8000;
+const DBT_DEVTYP_DEVICEINTERFACE: u32 = 0x0000_0005;
+const HWND_MESSAGE: HWND = -3isize as HWND;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
 const STATUS_DEVICE_NOT_CONNECTED: i32 = 0xC000_009Du32 as i32;
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
@@ -87,6 +91,18 @@ const OBJECT_TYPE_INFORMATION: u32 = 2;
 // { usize NumberOfHandles; usize Reserved; } followed by 40-byte entries, and
 // 16 + 40 * NumberOfHandles equals the kernel's reported return length exactly.
 const PROCESS_HANDLE_INFORMATION: i32 = 51;
+
+// Prefix shared by all WM_DEVICECHANGE broadcast payloads. SDL's private HID
+// detection window checks only this header for DBT_DEVICEARRIVAL, so no
+// variable-length device path follows it. SendMessageW consumes the pointer
+// synchronously while this stack value is alive.
+#[repr(C)]
+struct DeviceBroadcastHeader {
+    size: u32,
+    device_type: u32,
+    reserved: u32,
+}
+const _: () = assert!(size_of::<DeviceBroadcastHeader>() == 12);
 
 const MODULE_SNAPSHOT_LIMIT: usize = 512 * 1024 * 1024;
 const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
@@ -1748,6 +1764,74 @@ fn rescan_timer_loop(state: &'static RescanTimer) {
     }
 }
 
+// Steam's SDL HIDAPI backend retains a failed non-Valve controller until its
+// device-change generation advances. Merely asking CHIDIOThread to discover
+// again cannot revive that controller: SDL_GetJoysticks still returns an empty
+// snapshot even though raw hid_enumerate can see the device.
+//
+// The window class and SDL_UpdateJoysticks export are stable interface names;
+// no address inside SDL3.dll is assumed. The message must originate inside
+// Steam because LPARAM points at process-local memory. It is synchronous both
+// for pointer lifetime and to ensure the generation changes before the two SDL
+// updates. The first update may remove SDL's failed retained device and reset
+// the cached generation; the second observes the new generation and adds the
+// physical controller again.
+fn refresh_sdl_hidapi_devices() -> bool {
+    let class_name: Vec<u16> = "SDL_HIDAPI_DEVICE_DETECTION"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let current_process = unsafe { GetCurrentProcessId() };
+    let mut after: HWND = null_mut();
+    let window = loop {
+        let candidate = unsafe {
+            FindWindowExW(HWND_MESSAGE, after, class_name.as_ptr(), null())
+        };
+        if candidate.is_null() {
+            return false;
+        }
+        after = candidate;
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(candidate, &mut owner) };
+        if owner == current_process {
+            break candidate;
+        }
+    };
+
+    let header = DeviceBroadcastHeader {
+        size: size_of::<DeviceBroadcastHeader>() as u32,
+        device_type: DBT_DEVTYP_DEVICEINTERFACE,
+        reserved: 0,
+    };
+    let delivered = unsafe {
+        SendMessageW(
+            window,
+            WM_DEVICECHANGE,
+            DBT_DEVICEARRIVAL,
+            (&raw const header) as LPARAM,
+        )
+    };
+    if delivered == 0 {
+        return false;
+    }
+
+    let name: Vec<u16> = "SDL3.dll".encode_utf16().chain(Some(0)).collect();
+    let sdl = unsafe { GetModuleHandleW(name.as_ptr()) };
+    if sdl.is_null() {
+        return false;
+    }
+    let pointer = procedure(sdl, c"SDL_UpdateJoysticks".as_ptr().cast());
+    if pointer.is_null() {
+        return false;
+    }
+    let update: unsafe extern "C" fn() = unsafe { transmute_copy(&pointer) };
+    unsafe {
+        update();
+        update();
+    }
+    true
+}
+
 fn notify_controller_rescan() {
     // A lease that was just released may have provoked Steam into replacing
     // CHIDIOThread, so the cached address is exactly the one most likely to be
@@ -1756,6 +1840,10 @@ fn notify_controller_rescan() {
     if blocking() {
         return;
     }
+    // Valve devices bypass SDL's HIDAPI joystick provider, while controllers
+    // such as DualSense use it. Refreshing this layer is harmless when absent
+    // and must precede Steam's own discovery for non-Valve devices.
+    let _ = refresh_sdl_hidapi_devices();
     // Restoring controllers must never be answered from the negative cache:
     // status polls taken during the lease can spend the sweep budget, and the
     // crash-safe drop path has no host-side recovery to fall back on. The budget
@@ -1774,15 +1862,6 @@ fn notify_controller_rescan() {
     }
     // Unknown Steam builds receive the non-invasive compatibility fallback.
     unsafe { EnumWindows(Some(notify_window), 0) };
-    let name: Vec<u16> = "SDL3.dll".encode_utf16().chain(Some(0)).collect();
-    let sdl = unsafe { GetModuleHandleW(name.as_ptr()) };
-    if !sdl.is_null() {
-        let pointer = procedure(sdl, c"SDL_UpdateJoysticks".as_ptr().cast());
-        if !pointer.is_null() {
-            let update: unsafe extern "C" fn() = unsafe { transmute_copy(&pointer) };
-            unsafe { update() };
-        }
-    }
 }
 
 fn response(result: ResultCode) -> Response {

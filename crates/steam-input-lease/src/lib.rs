@@ -827,23 +827,30 @@ unsafe fn elect_running_hid_thread(
     let Some(before) =
         (unsafe { sample_candidates(process, candidates, deadline_offset, counter_offset) })
     else {
-        return Err(ambiguous_candidates(candidates));
+        return Err(unreadable_candidates(candidates));
     };
     notify_device_change(process_id);
 
     let deadline = Instant::now() + LIVE_ELECTION_TIMEOUT;
+    let mut last = before.clone();
     while Instant::now() < deadline {
         thread::sleep(LIVE_ELECTION_INTERVAL);
         let Some(after) =
             (unsafe { sample_candidates(process, candidates, deadline_offset, counter_offset) })
         else {
-            return Err(ambiguous_candidates(candidates));
+            return Err(unreadable_candidates(candidates));
         };
         if let Some(index) = select_progressing_candidate(&before, &after) {
             return Ok(candidates[index]);
         }
+        last = after;
     }
-    Err(ambiguous_candidates(candidates))
+    // The election gave up. Embed each candidate's first→last scheduler reading
+    // so wsgm.log distinguishes the two failure modes without a debugger: all
+    // "still" means the rebuilt HID thread had not resumed discovery inside the
+    // window (a timing problem), while two or more "MOVED" means genuinely live
+    // look-alikes that these two fields cannot separate (needs another field).
+    Err(ambiguous_candidates(candidates, &before, &last))
 }
 
 /// Reads the scheduler fields of every candidate. A candidate that cannot be
@@ -868,12 +875,57 @@ unsafe fn sample_candidates(
         .collect()
 }
 
-fn ambiguous_candidates(candidates: &[usize]) -> Error {
+fn ambiguous_candidates(
+    candidates: &[usize],
+    before: &[SchedulerSample],
+    after: &[SchedulerSample],
+) -> Error {
     Error::UnsupportedSteamBuild(format!(
         "runtime RTTI resolved, but {} live CHIDIOThread candidates were ambiguous \
-         and none could be elected by observing discovery scheduling",
+         and none could be elected by observing discovery scheduling [{}]",
+        candidates.len(),
+        describe_candidate_movement(candidates, before, after),
+    ))
+}
+
+/// A candidate address that read cleanly at RTTI resolution became unreadable
+/// mid-election. Distinguished from the ambiguous case because the cure is
+/// different: an unreadable candidate is a torn-down object, not a look-alike.
+fn unreadable_candidates(candidates: &[usize]) -> Error {
+    Error::UnsupportedSteamBuild(format!(
+        "runtime RTTI resolved, but a CHIDIOThread candidate among {} became unreadable \
+         during the discovery-scheduling election",
         candidates.len()
     ))
+}
+
+/// Renders each candidate's first→last scheduler reading for the log. `MOVED`
+/// marks a candidate whose deadline or counter changed across the window; all
+/// `still` points at timing, two or more `MOVED` at a missing discriminator.
+fn describe_candidate_movement(
+    candidates: &[usize],
+    before: &[SchedulerSample],
+    after: &[SchedulerSample],
+) -> String {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, address)| match (before.get(index), after.get(index)) {
+            (Some(b), Some(a)) => {
+                let moved = b.deadline_bits != a.deadline_bits || b.counter != a.counter;
+                format!(
+                    "{address:#x}: deadline {:#018x}->{:#018x} counter {}->{} {}",
+                    b.deadline_bits,
+                    a.deadline_bits,
+                    b.counter,
+                    a.counter,
+                    if moved { "MOVED" } else { "still" },
+                )
+            }
+            _ => format!("{address:#x}: unsampled"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Posts the device-change notification Windows sends on any device arrival to

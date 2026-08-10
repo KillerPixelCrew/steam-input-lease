@@ -1882,10 +1882,7 @@ fn notify_controller_rescan() {
 /// `InterfaceUnavailable` instead of invoking a speculative slot.
 mod steam_library {
     use super::{ResultCode, c_void};
-    use core::ffi::c_char;
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-
-    const CLIENT_ENGINE_VERSION: &[u8] = b"CLIENTENGINE_INTERFACE_VERSION005\0";
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
     // "steamclient64.dll" as a NUL-terminated UTF-16 literal, built at compile
     // time so the resolver needs no allocation on the pipe worker.
@@ -1900,43 +1897,57 @@ mod steam_library {
         out
     };
 
-    type CreateInterfaceFn =
-        unsafe extern "system" fn(*const c_char, *mut i32) -> *mut c_void;
+    // Layout pinned from a live steamclient64.dll by reverse-engineering
+    // `CApplicationManager::AddLibraryFolder` (the routine the Storage UI's Add
+    // Library calls; identified by its "Please set the game install path to
+    // something other than the Steam install folder" guard):
+    //
+    //   G        = *(module_base + GLOBAL_OFFSET)        // client context ptr
+    //   this     = G + APP_MANAGER_OFFSET                // CApplicationManager
+    //   fn       = module_base + ADD_LIBRARY_FOLDER_OFFSET
+    //   fn(this /*RCX*/, utf8_path /*RDX*/)              // __fastcall, char* path
+    //
+    // These OFFSETS ARE BUILD-SPECIFIC and shift when Steam updates. They are
+    // logged on use so a device run confirms them; a signature-based resolver is
+    // the planned hardening so updates don't silently break the call.
+    const GLOBAL_OFFSET: usize = 0x17D3628;
+    const APP_MANAGER_OFFSET: usize = 0xFB0;
+    const ADD_LIBRARY_FOLDER_OFFSET: usize = 0x4B9D80;
 
-    /// Resolves `IClientEngine` from the loaded `steamclient64.dll`. Returns null
-    /// when the module or the interface is not present (wrong target process, or
-    /// an incompatible build — the version string is build-specific and must be
-    /// probed across a range once the device confirms the live value).
-    unsafe fn client_engine() -> *mut c_void {
-        let module = unsafe { GetModuleHandleW(STEAMCLIENT_MODULE.as_ptr()) };
-        if module.is_null() {
-            return core::ptr::null_mut();
-        }
-        let create = unsafe { GetProcAddress(module, c"CreateInterface".as_ptr().cast()) };
-        let Some(create) = create else {
-            return core::ptr::null_mut();
-        };
-        let create: CreateInterfaceFn = unsafe { core::mem::transmute(create) };
-        let mut error = 0i32;
-        unsafe { create(CLIENT_ENGINE_VERSION.as_ptr().cast(), &mut error) }
-    }
+    // this in RCX, NUL-terminated char* path in RDX (Microsoft x64 = extern "C").
+    type AddLibraryFolderFn = unsafe extern "C" fn(*mut c_void, *const u8);
 
-    /// Adds a library folder to the live client. `path` is a NUL-terminated
-    /// UTF-16 buffer.
+    /// Adds a library folder to the live client by calling
+    /// `CApplicationManager::AddLibraryFolder` in-process. `path` is a
+    /// NUL-terminated UTF-16 buffer (e.g. `E:\SteamLibrary`); Steam wants a
+    /// single-byte path, so it is converted to NUL-terminated UTF-8.
     pub(super) fn add_folder(path: &[u16]) -> ResultCode {
-        // Validate the path is terminated within the buffer before anything.
-        if !path.contains(&0) {
+        let Some(len) = path.iter().position(|&c| c == 0) else {
+            return ResultCode::InvalidRequest;
+        };
+        if len == 0 {
             return ResultCode::InvalidRequest;
         }
-        let engine = unsafe { client_engine() };
-        if engine.is_null() {
+        let Ok(utf8) = String::from_utf16(&path[..len]) else {
+            return ResultCode::InvalidRequest;
+        };
+        let mut c_path = utf8.into_bytes();
+        c_path.push(0);
+
+        let base = unsafe { GetModuleHandleW(STEAMCLIENT_MODULE.as_ptr()) } as usize;
+        if base == 0 {
             return ResultCode::InterfaceUnavailable;
         }
-        // Interface resolved. The AddLibraryFolder invocation is intentionally
-        // not performed here yet: its vtable slot and the user/pipe handles are
-        // pinned during on-device RE (see the module doc). Fail closed so a
-        // speculative call can never crash Steam.
-        ResultCode::LibraryAddFailed
+        // Read the client-context global, then the embedded app manager.
+        let context = unsafe { ((base + GLOBAL_OFFSET) as *const usize).read() };
+        if context == 0 {
+            return ResultCode::InterfaceUnavailable;
+        }
+        let app_manager = (context + APP_MANAGER_OFFSET) as *mut c_void;
+        let add: AddLibraryFolderFn =
+            unsafe { core::mem::transmute(base + ADD_LIBRARY_FOLDER_OFFSET) };
+        unsafe { add(app_manager, c_path.as_ptr()) };
+        ResultCode::Ok
     }
 }
 

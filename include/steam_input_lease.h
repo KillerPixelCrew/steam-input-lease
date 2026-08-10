@@ -180,6 +180,15 @@ SIL_API int32_t sil_client_rescan(
 SIL_API int32_t sil_client_check_recovery(SilClient* client);
 
 /**
+ * Adds a Steam library folder to the live client, injecting the payload if
+ * needed. The payload calls the client's own AddLibraryFolder in-process, so
+ * Steam adopts, persists, mounts and scans the folder with no restart. `path`
+ * is a NUL-terminated UTF-16 folder path (e.g. L"E:\\SteamLibrary"). Returns
+ * SIL_OK on success; the reason is in sil_last_error_message() on failure.
+ */
+SIL_API int32_t sil_client_add_library(SilClient* client, const uint16_t* path);
+
+/**
  * Runs an executable/argument vector under a lease, waits for its Windows job
  * process tree, releases the lease, then writes the root process exit code.
  */

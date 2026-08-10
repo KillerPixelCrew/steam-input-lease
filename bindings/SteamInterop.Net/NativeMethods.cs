@@ -83,6 +83,11 @@ internal static class NativeMethods
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int sil_client_check_recovery(ClientHandle client);
 
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+    internal static extern int sil_client_add_library(
+        ClientHandle client,
+        [MarshalAs(UnmanagedType.LPWStr)] string path);
+
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int sil_client_run_wrapped(
         ClientHandle client,

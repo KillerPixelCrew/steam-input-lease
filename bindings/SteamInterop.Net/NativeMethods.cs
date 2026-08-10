@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace SteamInputLease;
+namespace SteamInterop;
 
 internal static class NativeMethods
 {

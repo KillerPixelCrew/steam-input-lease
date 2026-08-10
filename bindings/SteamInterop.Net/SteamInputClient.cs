@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace SteamInputLease;
+namespace SteamInterop;
 
 /// <summary>
 /// Loads and controls the process-global Steam Input gate. Instances are cheap;

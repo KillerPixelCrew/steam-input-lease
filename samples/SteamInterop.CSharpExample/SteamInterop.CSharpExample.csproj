@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\bindings\SteamInputLease.Net\SteamInputLease.Net.csproj" />
+    <ProjectReference Include="..\..\bindings\SteamInterop.Net\SteamInterop.Net.csproj" />
   </ItemGroup>
 </Project>
 

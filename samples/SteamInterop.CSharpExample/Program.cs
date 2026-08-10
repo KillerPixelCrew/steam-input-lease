@@ -1,4 +1,4 @@
-using SteamInputLease;
+using SteamInterop;
 
 var options = new SteamInputClientOptions();
 if (Environment.GetEnvironmentVariable("SIL_TARGET_NAME") is { Length: > 0 } targetName)

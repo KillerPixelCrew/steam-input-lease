@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Cargo release build failed with exit code $LASTEXITCODE"
 }
 
-$managedProject = Join-Path $workspace 'bindings\SteamInputLease.Net\SteamInputLease.Net.csproj'
+$managedProject = Join-Path $workspace 'bindings\SteamInterop.Net\SteamInterop.Net.csproj'
 # Building after Cargo makes the conditional native runtime assets available to
 # the managed project and eventual NuGet package.
 dotnet build $managedProject -c Release --nologo
@@ -53,7 +53,7 @@ Copy-Item -Force -LiteralPath (Join-Path $release 'steam_input_gate.dll') -Desti
 Copy-Item -Force -LiteralPath (Join-Path $release 'steam_input_lease_ffi.dll') -Destination $native
 Copy-Item -Force -LiteralPath (Join-Path $workspace 'include\steam_input_lease.h') -Destination $include
 
-$managedOutput = Join-Path $workspace 'bindings\SteamInputLease.Net\bin\Release\net8.0'
+$managedOutput = Join-Path $workspace 'bindings\SteamInterop.Net\bin\Release\net8.0'
 Copy-Item -Force -LiteralPath (Join-Path $managedOutput 'SteamInputLease.dll') -Destination $managed
 Copy-Item -Force -LiteralPath (Join-Path $managedOutput 'SteamInputLease.xml') -Destination $managed
 Copy-Item -Force -LiteralPath (Join-Path $workspace 'LICENSE-MIT') -Destination $artifactRoot

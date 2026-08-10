@@ -370,7 +370,7 @@ becomes `255`. `--status`, `--rescan`, and `--help` return `0`; errors return
 
 ```powershell
 cargo build --workspace --release
-dotnet build .\bindings\SteamInputLease.Net\SteamInputLease.Net.csproj -c Release
+dotnet build .\bindings\SteamInterop.Net\SteamInterop.Net.csproj -c Release
 ```
 
 Quality gates:
@@ -646,7 +646,7 @@ before concluding it failed.
 | `steam-input-gate` | `steam_input_gate.dll` | Injected hook engine and pipe server |
 | `steam-input-lease-ffi` | `steam_input_lease_ffi.dll` | Stable C ABI |
 | `steam-input-lease-cli` | `steam-input-lease.exe` | Launch wrapper and diagnostics |
-| `SteamInputLease.Net` | `SteamInputLease.dll` | .NET 8 `SafeHandle` binding |
+| `SteamInterop.Net` | `SteamInputLease.dll` | .NET 8 `SafeHandle` binding |
 | `steam-input-test-target` | test exe | Isolated injection validation target |
 
 ```text
@@ -659,7 +659,7 @@ SteamInput/                       artifacts/            (after build.ps1)
 │   ├── steam-input-lease-ffi/        ├── steam_input_lease_ffi.dll
 │   ├── steam-input-recovery/         ├── LICENSE-MIT
 │   └── steam-input-test-target/      ├── README.md
-├── bindings/SteamInputLease.Net/     ├── THIRD_PARTY_LICENSES.md
+├── bindings/SteamInterop.Net/     ├── THIRD_PARTY_LICENSES.md
 ├── include/steam_input_lease.h       ├── include/
 ├── samples/                          ├── managed/
 └── scripts/                          └── native/

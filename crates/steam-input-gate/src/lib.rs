@@ -33,8 +33,8 @@ use minhook_sys::{
     MH_QueueEnableHook, MH_Uninitialize,
 };
 use steam_input_lease_core::{
-    CAPABILITY_INTERNAL_RECOVERY, Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response,
-    ResultCode,
+    CAPABILITY_INTERNAL_RECOVERY, Command, LibraryRequest, PROTOCOL_MAGIC, PROTOCOL_VERSION,
+    Request, Response, ResultCode,
 };
 use steam_input_recovery::{
     RecoveryLayout, SchedulerSample, find_vtable_pairs, resolve_recovery_layout,
@@ -1864,6 +1864,82 @@ fn notify_controller_rescan() {
     unsafe { EnumWindows(Some(notify_window), 0) };
 }
 
+/// In-process Steam library management, invoked from the pipe worker when the
+/// host asks to add a library folder to the live client.
+///
+/// The mechanism (confirmed by reverse-engineering `steamclient64.dll`): the
+/// SteamOS/ChromeOS auto-mount path is `Plat_`-gated OFF on Windows, so a card
+/// marker alone never registers a library there. The client-side add the
+/// "Add Library" UI performs is `IClientAppManager::AddLibraryFolder`, obtained
+/// from `IClientEngine` (`CLIENTENGINE_INTERFACE_VERSION005`). Calling it live
+/// adds, persists, mounts, and scans without a restart.
+///
+/// This module resolves the interface but currently FAILS CLOSED at the call
+/// itself: the `AddLibraryFolder` vtable slot and the `hSteamUser`/`hSteamPipe`
+/// handles must be read from a live Steam on-device (breakpoint the real add
+/// flow) rather than guessed — a wrong vtable call crashes the host process.
+/// Until that on-device step pins the offsets, this returns
+/// `InterfaceUnavailable` instead of invoking a speculative slot.
+mod steam_library {
+    use super::{ResultCode, c_void};
+    use core::ffi::c_char;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    const CLIENT_ENGINE_VERSION: &[u8] = b"CLIENTENGINE_INTERFACE_VERSION005\0";
+
+    // "steamclient64.dll" as a NUL-terminated UTF-16 literal, built at compile
+    // time so the resolver needs no allocation on the pipe worker.
+    const STEAMCLIENT_MODULE: [u16; 18] = {
+        let bytes = b"steamclient64.dll";
+        let mut out = [0u16; 18];
+        let mut i = 0;
+        while i < bytes.len() {
+            out[i] = bytes[i] as u16;
+            i += 1;
+        }
+        out
+    };
+
+    type CreateInterfaceFn =
+        unsafe extern "system" fn(*const c_char, *mut i32) -> *mut c_void;
+
+    /// Resolves `IClientEngine` from the loaded `steamclient64.dll`. Returns null
+    /// when the module or the interface is not present (wrong target process, or
+    /// an incompatible build — the version string is build-specific and must be
+    /// probed across a range once the device confirms the live value).
+    unsafe fn client_engine() -> *mut c_void {
+        let module = unsafe { GetModuleHandleW(STEAMCLIENT_MODULE.as_ptr()) };
+        if module.is_null() {
+            return core::ptr::null_mut();
+        }
+        let create = unsafe { GetProcAddress(module, c"CreateInterface".as_ptr().cast()) };
+        let Some(create) = create else {
+            return core::ptr::null_mut();
+        };
+        let create: CreateInterfaceFn = unsafe { core::mem::transmute(create) };
+        let mut error = 0i32;
+        unsafe { create(CLIENT_ENGINE_VERSION.as_ptr().cast(), &mut error) }
+    }
+
+    /// Adds a library folder to the live client. `path` is a NUL-terminated
+    /// UTF-16 buffer.
+    pub(super) fn add_folder(path: &[u16]) -> ResultCode {
+        // Validate the path is terminated within the buffer before anything.
+        if !path.contains(&0) {
+            return ResultCode::InvalidRequest;
+        }
+        let engine = unsafe { client_engine() };
+        if engine.is_null() {
+            return ResultCode::InterfaceUnavailable;
+        }
+        // Interface resolved. The AddLibraryFolder invocation is intentionally
+        // not performed here yet: its vtable slot and the user/pipe handles are
+        // pinned during on-device RE (see the module doc). Fail closed so a
+        // speculative call can never crash Steam.
+        ResultCode::LibraryAddFailed
+    }
+}
+
 fn response(result: ResultCode) -> Response {
     Response {
         magic: PROTOCOL_MAGIC,
@@ -1878,19 +1954,23 @@ fn response(result: ResultCode) -> Response {
 
 unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
     let pipe = parameter as HANDLE;
-    let mut request: Request = unsafe { zeroed() };
+    // Read into the LARGER message so the path-carrying AddLibraryFolder command
+    // arrives whole (message-mode pipe): the bare lease/status commands still
+    // send only the 8-byte header, so `transferred` distinguishes them.
+    let mut message: LibraryRequest = unsafe { zeroed() };
     let mut transferred = 0;
     let read = unsafe {
         ReadFile(
             pipe,
-            (&mut request as *mut Request).cast(),
-            size_of::<Request>() as u32,
+            (&mut message as *mut LibraryRequest).cast(),
+            size_of::<LibraryRequest>() as u32,
             &mut transferred,
             null_mut(),
         )
     } != FALSE;
+    let request = message.header;
     let valid = read
-        && transferred == size_of::<Request>() as u32
+        && transferred >= size_of::<Request>() as u32
         && request.magic == PROTOCOL_MAGIC
         && request.version == PROTOCOL_VERSION;
 
@@ -1909,6 +1989,12 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
         ResultCode::Ok
     } else if request.command == Command::QueryStatus as u16 {
         ResultCode::Ok
+    } else if request.command == Command::AddLibraryFolder as u16 {
+        if transferred == size_of::<LibraryRequest>() as u32 {
+            steam_library::add_folder(&message.path)
+        } else {
+            ResultCode::InvalidRequest
+        }
     } else {
         ResultCode::InvalidRequest
     };

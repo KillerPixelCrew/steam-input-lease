@@ -25,11 +25,6 @@ pub enum Command {
     QueryStatus = 2,
     /// Explicitly release a previously acquired lease connection.
     ReleaseLease = 3,
-    /// Add a Steam library folder to the live client by calling
-    /// `IClientAppManager::AddLibraryFolder` in-process. Carries a
-    /// [`LibraryRequest`] (header plus the folder path) rather than the bare
-    /// [`Request`], so the server reads the larger message for this command.
-    AddLibraryFolder = 4,
 }
 
 /// Result values returned in [`Response::result`].
@@ -42,49 +37,6 @@ pub enum ResultCode {
     InvalidRequest = 1,
     /// The payload could not install its required hooks.
     HookInitializationFailed = 2,
-    /// The Steam client interface for library management could not be
-    /// resolved in-process (wrong target, or an incompatible Steam build).
-    InterfaceUnavailable = 3,
-    /// The interface was resolved but the add-library call failed or was
-    /// rejected by Steam.
-    LibraryAddFailed = 4,
-}
-
-/// The maximum library-path length carried in a [`LibraryRequest`], in UTF-16
-/// code units including the terminator. Matches Windows `MAX_PATH`.
-pub const MAX_LIBRARY_PATH_UNITS: usize = 260;
-
-/// A [`Command::AddLibraryFolder`] request: the fixed header followed by a
-/// fixed-size, NUL-terminated UTF-16 folder path. Fixed-width so the wire stays
-/// `#[repr(C)]` with no length prefixes to validate.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LibraryRequest {
-    /// The standard request header; `command` must be
-    /// [`Command::AddLibraryFolder`].
-    pub header: Request,
-    /// The library folder path (e.g. `E:\SteamLibrary`), NUL-terminated,
-    /// zero-padded. A path that fills the buffer without a terminator is
-    /// rejected by the payload.
-    pub path: [u16; MAX_LIBRARY_PATH_UNITS],
-}
-
-impl LibraryRequest {
-    /// Builds an add-library request for `path`. Returns `None` when the path
-    /// does not fit with a terminator.
-    #[must_use]
-    pub fn new(path: &[u16]) -> Option<Self> {
-        // Reserve one unit for the terminator.
-        if path.len() >= MAX_LIBRARY_PATH_UNITS {
-            return None;
-        }
-        let mut buffer = [0u16; MAX_LIBRARY_PATH_UNITS];
-        buffer[..path.len()].copy_from_slice(path);
-        Some(Self {
-            header: Request::new(Command::AddLibraryFolder),
-            path: buffer,
-        })
-    }
 }
 
 /// Fixed-size request header sent from a host client to the payload.

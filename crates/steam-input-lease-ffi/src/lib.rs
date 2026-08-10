@@ -234,47 +234,13 @@ unsafe fn client_ref<'a>(client: *mut SilClient) -> Result<&'a Client, String> {
         .ok_or_else(|| "client handle was null".into())
 }
 
-/// Adds a Steam library folder to the live client, injecting the payload if
-/// needed. `path` is a NUL-terminated UTF-16 folder path (e.g. `E:\SteamLibrary`).
-/// Returns [`SIL_OK`] on success; on failure the reason is in
-/// [`sil_last_error_message`].
-///
-/// # Safety
-/// `client` must be a handle from [`sil_client_create`] and `path` a valid
-/// NUL-terminated UTF-16 string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sil_client_add_library(
-    client: *mut SilClient,
-    path: *const u16,
-) -> i32 {
-    ffi_call(|| {
-        let client = unsafe { client_ref(client) }?;
-        if path.is_null() {
-            return Err("required library path pointer was null".into());
-        }
-        let mut length = 0usize;
-        while length < 32_768 && unsafe { *path.add(length) } != 0 {
-            length += 1;
-        }
-        if length == 0 {
-            return Err("library path was empty".into());
-        }
-        if length == 32_768 {
-            return Err("library path exceeds 32767 code units".into());
-        }
-        let units = unsafe { std::slice::from_raw_parts(path, length) };
-        client.add_library_folder(units).map_err(|error| error.to_string())
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Returns the version of the exported C ABI, currently `3`.
+/// Returns the version of the exported C ABI, currently `2`.
 ///
 /// Version `2` changed `sil_lease_release` to report a [`SilReleaseOutcome`]
-/// instead of a bare [`SilStatus`]. Version `3` added `sil_client_add_library`
-/// for adding a Steam library folder to the live client.
+/// instead of a bare [`SilStatus`].
 pub extern "C" fn sil_abi_version() -> u32 {
-    3
+    2
 }
 
 #[unsafe(no_mangle)]

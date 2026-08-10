@@ -88,16 +88,6 @@ public sealed class SteamInputClient : IDisposable
     public void CheckRecovery() => NativeMethods.ThrowIfFailed(
         NativeMethods.sil_client_check_recovery(_handle));
 
-    /// <summary>Adds a Steam library folder to the LIVE client, injecting the
-    /// payload if needed: the payload calls the client's own
-    /// <c>AddLibraryFolder</c> in-process, so Steam adopts, persists, mounts and
-    /// scans the folder with no restart and no config-file editing.</summary>
-    /// <param name="path">The library folder, e.g. <c>E:\SteamLibrary</c>.</param>
-    /// <exception cref="SteamInputLeaseException">The folder could not be added
-    /// (Steam not running, an incompatible Steam build, or a rejected add).</exception>
-    public void AddLibraryFolder(string path) => NativeMethods.ThrowIfFailed(
-        NativeMethods.sil_client_add_library(_handle, path));
-
     /// <summary>Runs a process tree while Steam Input is blocked.</summary>
     /// <param name="arguments">Executable followed by its individual arguments.</param>
     /// <returns>The root process exit code after synchronous lease recovery.</returns>

@@ -40,9 +40,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use steam_input_lease_core::{
-    Command, LibraryRequest, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response, ResultCode,
-};
+use steam_input_lease_core::{Command, Request, Response};
 use steam_input_recovery::{
     RecoveryLayout, SchedulerSample, find_vtable_pairs, resolve_recovery_layout,
     select_progressing_candidate,
@@ -384,28 +382,6 @@ impl Client {
     /// in-process resolver is unavailable.
     pub fn check_recovery(&self) -> Result<()> {
         resolve_remote_recovery(self.process_id()?).map(|_| ())
-    }
-
-    /// Adds a Steam library folder to the LIVE client, injecting the payload
-    /// first if needed: the payload calls `CApplicationManager::AddLibraryFolder`
-    /// in-process, so Steam adopts, persists, mounts and scans the folder with no
-    /// restart. `path` is a UTF-16 folder path such as `E:\SteamLibrary`.
-    pub fn add_library_folder(&self, path: &[u16]) -> Result<()> {
-        let process_id = self.process_id()?;
-        let pipe = self.connect_or_inject(process_id)?;
-        let request = LibraryRequest::new(path)
-            .ok_or_else(|| Error::Message("library path is too long".into()))?;
-        let response = exchange_library(pipe.raw(), &request)?;
-        if response.result == ResultCode::Ok as u32 {
-            Ok(())
-        } else if response.result == ResultCode::InterfaceUnavailable as u32 {
-            Err(Error::Message(
-                "the Steam library interface could not be reached (incompatible Steam build?)"
-                    .into(),
-            ))
-        } else {
-            Err(Error::Message("Steam rejected the library-folder add".into()))
-        }
     }
 
     // The initial probe only has to cover the window in which a resident payload
@@ -1246,45 +1222,6 @@ fn exchange(pipe: HANDLE, command: Command) -> Result<Response> {
         if !response.is_valid() {
             return Err(Error::Protocol(
                 "the payload rejected the command or uses a different protocol version".into(),
-            ));
-        }
-        Ok(response)
-    }
-}
-
-fn exchange_library(pipe: HANDLE, request: &LibraryRequest) -> Result<Response> {
-    // Like `exchange`, but carries the larger path-bearing message and returns
-    // the response for ANY valid header — the add-library result codes
-    // (interface-unavailable, add-failed) are meaningful to the caller and must
-    // not be flattened into a protocol error the way `Response::is_valid` would.
-    unsafe {
-        let mut transferred = 0;
-        if WriteFile(
-            pipe,
-            (request as *const LibraryRequest).cast(),
-            size_of::<LibraryRequest>() as u32,
-            &mut transferred,
-            null_mut(),
-        ) == FALSE
-            || transferred != size_of::<LibraryRequest>() as u32
-        {
-            return Err(Error::windows("could not send add-library command to payload"));
-        }
-        let mut response: Response = zeroed();
-        if ReadFile(
-            pipe,
-            (&mut response as *mut Response).cast(),
-            size_of::<Response>() as u32,
-            &mut transferred,
-            null_mut(),
-        ) == FALSE
-            || transferred != size_of::<Response>() as u32
-        {
-            return Err(Error::windows("could not read payload response"));
-        }
-        if response.magic != PROTOCOL_MAGIC || response.version != PROTOCOL_VERSION {
-            return Err(Error::Protocol(
-                "the payload uses a different protocol version".into(),
             ));
         }
         Ok(response)

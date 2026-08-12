@@ -342,7 +342,9 @@ impl Client {
     /// then resumed so quickly spawned descendants are included in the wait.
     /// Release is attempted even when process creation or waiting fails.
     ///
-    /// Returns the root process exit code after the final release handshake.
+    /// Returns the root process exit code after the final release handshake. An
+    /// error means the target never started, so the caller may safely launch it
+    /// itself; a failed release after a completed run is not an error.
     pub fn run_wrapped<I, S>(&self, command: I) -> Result<u32>
     where
         I: IntoIterator<Item = S>,
@@ -359,12 +361,15 @@ impl Client {
         let launched = launch_and_wait(&arguments);
         let released = lease.release();
         match (launched, released) {
-            // A wrapped run reports the game's exit code. Recovery that could
-            // not run is not the game's failure, and blocking is lifted either
-            // way, so only a failed release handshake replaces the exit code.
-            (Ok(exit_code), Ok(_)) => Ok(exit_code),
+            // An error from this function means the target never ran, because that
+            // is what the caller does about it: WSGM.Launch fails open by launching
+            // the command itself. A release handshake that fails AFTER the game has
+            // already exited must therefore not surface as an error — Steam quits
+            // during play often enough, and reporting it made the wrapper start the
+            // finished game a second time. Blocking is lifted either way: the lease
+            // is an open pipe connection that Windows drops with this process.
+            (Ok(exit_code), _) => Ok(exit_code),
             (Err(launch_error), _) => Err(launch_error),
-            (Ok(_), Err(release_error)) => Err(release_error),
         }
     }
 
@@ -1321,9 +1326,12 @@ fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
             WaitForSingleObject(process_handle.raw(), INFINITE);
         }
 
+        // The tree has already run and exited by here, so an unreadable exit code
+        // is reported as zero rather than as an error: the caller treats an error
+        // as "the target never started" and would run it again.
         let mut exit_code = 0;
         if GetExitCodeProcess(process_handle.raw(), &mut exit_code) == FALSE {
-            return Err(Error::windows("could not read wrapped process exit code"));
+            exit_code = 0;
         }
         Ok(exit_code)
     }

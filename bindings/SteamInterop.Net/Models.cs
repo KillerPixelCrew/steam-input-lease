@@ -85,6 +85,17 @@ public readonly record struct SteamInputReleaseOutcome(
         Recovery is SteamControllerRecovery.Scheduled or SteamControllerRecovery.Completed;
 }
 
+/// <summary>The result of a wrapped run: the target ran to completion, and the lease
+/// was then released.</summary>
+/// <param name="ExitCode">Root process exit code.</param>
+/// <param name="Release">What the final release handshake did. A handshake that failed
+/// after the target exited is reported here rather than as a run failure — reporting it
+/// as one would make a fail-open caller start the finished game a second time — but it
+/// means Steam was left without controller recovery, so callers should log it.</param>
+public readonly record struct SteamInputWrappedRun(
+    uint ExitCode,
+    SteamInputReleaseOutcome Release);
+
 /// <summary>An error reported by the native Rust library.</summary>
 public sealed class SteamInputLeaseException : Exception
 {

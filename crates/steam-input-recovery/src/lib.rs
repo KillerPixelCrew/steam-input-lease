@@ -207,6 +207,24 @@ pub fn find_vtable_pairs(
 /// `image`. The byte slice is indexed by RVA and should be `SizeOfImage` bytes
 /// long; unreadable pages may be zero-filled. The resolver never dereferences
 /// addresses from the snapshot.
+///
+/// # Errors
+///
+/// Every failure means the layout could not be proven from this image, and the
+/// caller must fall back rather than act on a guess:
+///
+/// - [`ResolveError::InvalidPe`] — the bytes are not a supported loaded PE32+ image.
+/// - [`ResolveError::RttiNameCount`] — the Valve RTTI type name was absent, or
+///   occurred more than once so no single class could be selected.
+/// - [`ResolveError::CompleteObjectLocatorNotFound`] — no valid complete-object
+///   locator referenced the RTTI type descriptor.
+/// - [`ResolveError::VtableNotUnique`] — a required primary or secondary vtable
+///   could not be proven unique.
+/// - [`ResolveError::SchedulerNotUnique`] — no unique virtual method carried the
+///   guarded scheduler semantics.
+///
+/// A Steam update that moves any of these is expected to surface here as an error,
+/// not as a wrong address.
 pub fn resolve_recovery_layout(
     module_base: usize,
     image: &[u8],
@@ -385,7 +403,7 @@ fn find_complete_object_locators(image: &[u8], type_descriptor_rva: u32) -> Vec<
     // `pTypeDescriptor` is the only field of a locator that is specific to this
     // class, so it decides candidacy; the remaining fields merely confirm.
     for (index, word) in image.chunks_exact(4).enumerate() {
-        if u32::from_le_bytes(word.try_into().unwrap()) != type_descriptor_rva {
+        if u32::from_le_bytes(word.try_into().unwrap_or_default()) != type_descriptor_rva {
             continue;
         }
         let field = index * 4;
@@ -601,7 +619,7 @@ fn for_each_byte(haystack: &[u8], needle: u8, mut on_hit: impl FnMut(usize)) {
     let mut base = 0usize;
     let mut chunks = haystack.chunks_exact(8);
     for chunk in &mut chunks {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap()) ^ broadcast;
+        let word = u64::from_le_bytes(chunk.try_into().unwrap_or_default()) ^ broadcast;
         let mut mask = word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
         while mask != 0 {
             let lane = (mask.trailing_zeros() / 8) as usize;

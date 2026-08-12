@@ -11,11 +11,16 @@ use std::process::ExitCode;
 use steam_input_lease::{Client, ClientOptions};
 
 fn usage() {
+    // Development/diagnostic front-end only: this binary is deliberately not
+    // shipped, and the installer deletes it on update. The user-facing wrapper
+    // is WSGM.Launch.exe, so never advertise this path as a launch option.
     eprintln!(
-        "Steam Input Lease\n\n\
-         Steam launch options:\n  \"C:\\path\\steam-input-lease.exe\" -- %command%\n\n\
+        "Steam Input Lease (development diagnostic tool; not the user-facing wrapper)\n\n\
+         Steam launch options are configured with WSGM.Launch.exe instead:\n  \
+         \"C:\\path\\WSGM.Launch.exe\" [--deelevate] [--input-lease] -- %command%\n\n\
          Status:\n  steam-input-lease.exe --status\n\n\
          Controller recovery:\n  steam-input-lease.exe --rescan\n\n\
+         Wrapped run (diagnostics):\n  steam-input-lease.exe -- program.exe arguments\n\n\
          Options:\n  --target-name process.exe\n  --payload path\\steam_input_gate.dll"
     );
 }
@@ -79,11 +84,19 @@ fn run() -> Result<u32, String> {
     }
 
     println!("Acquiring Steam Input block lease...");
-    let exit_code = client
+    let run = client
         .run_wrapped(command)
         .map_err(|error| error.to_string())?;
-    println!("Game process tree exited; Steam Input unblocked.");
-    Ok(exit_code)
+    match &run.release {
+        Ok(_) => println!("Game process tree exited; Steam Input unblocked."),
+        // Blocking is lifted regardless (the pipe dies with this process), but
+        // Steam was not asked to rediscover controllers.
+        Err(error) => println!(
+            "Game process tree exited; Steam Input unblocked, but the release \
+             handshake failed and controller recovery did not run: {error}"
+        ),
+    }
+    Ok(run.exit_code)
 }
 
 fn main() -> ExitCode {

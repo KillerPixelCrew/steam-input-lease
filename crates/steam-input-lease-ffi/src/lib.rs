@@ -31,7 +31,7 @@ const SIL_ERROR: i32 = 1;
 const SIL_PANIC: i32 = 2;
 
 thread_local! {
-    static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+    static LAST_ERROR: RefCell<CString> = RefCell::new(c"".to_owned());
 }
 
 /// Options accepted by [`sil_client_create`]. Null string fields select the
@@ -235,12 +235,13 @@ unsafe fn client_ref<'a>(client: *mut SilClient) -> Result<&'a Client, String> {
 }
 
 #[unsafe(no_mangle)]
-/// Returns the version of the exported C ABI, currently `2`.
+/// Returns the version of the exported C ABI, currently `3`.
 ///
 /// Version `2` changed `sil_lease_release` to report a [`SilReleaseOutcome`]
-/// instead of a bare [`SilStatus`].
+/// instead of a bare [`SilStatus`]. Version `3` added the `release` output to
+/// `sil_client_run_wrapped`, which previously discarded the final handshake.
 pub extern "C" fn sil_abi_version() -> u32 {
-    2
+    3
 }
 
 #[unsafe(no_mangle)]
@@ -450,14 +451,21 @@ pub unsafe extern "C" fn sil_client_check_recovery(client: *mut SilClient) -> i3
 /// The call is synchronous and waits for the launched Windows process tree and
 /// final release handshake before returning.
 ///
+/// `release` is optional: pass null to ignore the final handshake. When it is
+/// supplied and the handshake failed, `recovery` is [`SIL_RECOVERY_UNAVAILABLE`]
+/// and `recovery_message` carries the reason. A failed handshake is NOT a call
+/// failure — the target already ran, and reporting it as one would make a caller
+/// start the finished game a second time.
+///
 /// # Safety
 /// `client` must be live, `argv` must hold `argc` valid NUL-terminated UTF-16
-/// pointers, and `exit_code` must be writable.
+/// pointers, `exit_code` must be writable, and `release` must be null or writable.
 pub unsafe extern "C" fn sil_client_run_wrapped(
     client: *mut SilClient,
     argc: usize,
     argv: *const *const u16,
     exit_code: *mut u32,
+    release: *mut SilReleaseOutcome,
 ) -> i32 {
     ffi_call(|| {
         if argv.is_null() || exit_code.is_null() || argc == 0 {
@@ -471,7 +479,21 @@ pub unsafe extern "C" fn sil_client_run_wrapped(
         let value = unsafe { client_ref(client)? }
             .run_wrapped(arguments)
             .map_err(|error| error.to_string())?;
-        unsafe { *exit_code = value };
+        unsafe { *exit_code = value.exit_code };
+        if !release.is_null() {
+            let outcome = match value.release {
+                Ok(outcome) => outcome.into(),
+                Err(error) => {
+                    let mut failed = SilReleaseOutcome {
+                        recovery: SIL_RECOVERY_UNAVAILABLE,
+                        ..SilReleaseOutcome::default()
+                    };
+                    write_fixed_utf8(&mut failed.recovery_message, &error.to_string());
+                    failed
+                }
+            };
+            unsafe { *release = outcome };
+        }
         Ok(())
     })
 }

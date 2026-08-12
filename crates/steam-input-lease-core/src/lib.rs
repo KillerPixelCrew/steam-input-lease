@@ -28,6 +28,11 @@ pub enum Command {
 }
 
 /// Result values returned in [`Response::result`].
+///
+/// Only states the payload can actually report are listed. A payload whose hook
+/// installation fails never serves the pipe at all, so that condition reaches
+/// the host as an unavailable pipe rather than as a result code; value `2` stays
+/// reserved for it should the payload ever answer in a degraded state.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultCode {
@@ -35,8 +40,6 @@ pub enum ResultCode {
     Ok = 0,
     /// The request header, protocol version, or command was invalid.
     InvalidRequest = 1,
-    /// The payload could not install its required hooks.
-    HookInitializationFailed = 2,
 }
 
 /// Fixed-size request header sent from a host client to the payload.

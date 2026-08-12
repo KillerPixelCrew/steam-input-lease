@@ -88,7 +88,8 @@ internal static class NativeMethods
         ClientHandle client,
         nuint argumentCount,
         nint arguments,
-        out uint exitCode);
+        out uint exitCode,
+        out ReleaseOutcome release);
 
     internal static void ThrowIfFailed(int result)
     {

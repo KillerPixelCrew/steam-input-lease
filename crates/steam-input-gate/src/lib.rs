@@ -29,8 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minhook_sys::{
-    MH_ApplyQueued, MH_CreateHook, MH_ERROR_ALREADY_CREATED, MH_Initialize, MH_OK,
-    MH_QueueEnableHook, MH_Uninitialize,
+    MH_ApplyQueued, MH_CreateHook, MH_Initialize, MH_OK, MH_QueueEnableHook, MH_Uninitialize,
 };
 use steam_input_lease_core::{
     CAPABILITY_INTERNAL_RECOVERY, Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response,
@@ -69,8 +68,8 @@ use windows_sys::Win32::System::Threading::{
     CreateThread, GetCurrentProcess, GetCurrentProcessId, SetEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GetWindowThreadProcessId, PostMessageW, SendMessageW,
-    WM_DEVICECHANGE,
+    EnumWindows, FindWindowExW, GetWindowThreadProcessId, PostMessageW, SMTO_NORMAL,
+    SendMessageTimeoutW, WM_DEVICECHANGE,
 };
 
 // Win32/NT constants that windows-sys does not expose through the selected API
@@ -94,8 +93,9 @@ const PROCESS_HANDLE_INFORMATION: i32 = 51;
 
 // Prefix shared by all WM_DEVICECHANGE broadcast payloads. SDL's private HID
 // detection window checks only this header for DBT_DEVICEARRIVAL, so no
-// variable-length device path follows it. SendMessageW consumes the pointer
-// synchronously while this stack value is alive.
+// variable-length device path follows it. The send is synchronous but bounded,
+// and a timed-out send does not cancel the queued message, so the instance that
+// is sent lives in the image rather than on the sending thread's stack.
 #[repr(C)]
 struct DeviceBroadcastHeader {
     size: u32,
@@ -103,6 +103,12 @@ struct DeviceBroadcastHeader {
     reserved: u32,
 }
 const _: () = assert!(size_of::<DeviceBroadcastHeader>() == 12);
+
+// Upper bound for that synchronous notification. A pipe worker sends it before
+// writing the release response, and the host waits on that response with no
+// timeout of its own, so one Steam thread that stops pumping messages would
+// otherwise wedge the whole lease state machine for the session.
+const SDL_DEVICE_CHANGE_TIMEOUT_MS: u32 = 2_000;
 
 const MODULE_SNAPSHOT_LIMIT: usize = 512 * 1024 * 1024;
 const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
@@ -292,6 +298,11 @@ type RescanTimer = (Mutex<Option<Instant>>, Condvar);
 static RESCAN_TIMER: OnceLock<&'static RescanTimer> = OnceLock::new();
 static RESCAN_TIMER_STARTED: AtomicBool = AtomicBool::new(false);
 const SECOND_DISCOVERY_DELAY: Duration = Duration::from_millis(2200);
+
+// Consecutive CreateNamedPipeW failures the control server tolerates before it
+// gives up, and the pause between attempts.
+const PIPE_CREATE_MAX_FAILURES: u32 = 30;
+const PIPE_CREATE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
 struct RuntimeRecoveryLayout {
@@ -1019,7 +1030,7 @@ unsafe fn queue_hook(
     }
     let mut trampoline = null_mut();
     let status = unsafe { MH_CreateHook(target, detour, &mut trampoline) };
-    if status == MH_ERROR_ALREADY_CREATED || status != MH_OK {
+    if status != MH_OK {
         return !required;
     }
     original.store(trampoline, Ordering::Release);
@@ -1771,11 +1782,11 @@ fn rescan_timer_loop(state: &'static RescanTimer) {
 //
 // The window class and SDL_UpdateJoysticks export are stable interface names;
 // no address inside SDL3.dll is assumed. The message must originate inside
-// Steam because LPARAM points at process-local memory. It is synchronous both
-// for pointer lifetime and to ensure the generation changes before the two SDL
-// updates. The first update may remove SDL's failed retained device and reset
-// the cached generation; the second observes the new generation and adds the
-// physical controller again.
+// Steam because LPARAM points at process-local memory. It is sent synchronously
+// so the generation changes before the two SDL updates, but with a bounded
+// timeout because the release handshake waits on this call. The first update
+// may remove SDL's failed retained device and reset the cached generation; the
+// second observes the new generation and adds the physical controller again.
 fn refresh_sdl_hidapi_devices() -> bool {
     let class_name: Vec<u16> = "SDL_HIDAPI_DEVICE_DETECTION"
         .encode_utf16()
@@ -1798,20 +1809,29 @@ fn refresh_sdl_hidapi_devices() -> bool {
         }
     };
 
-    let header = DeviceBroadcastHeader {
+    // Static, not stack: a send that times out below leaves the message queued,
+    // so the receiving thread may dereference this pointer after this function
+    // has already returned.
+    static HEADER: DeviceBroadcastHeader = DeviceBroadcastHeader {
         size: size_of::<DeviceBroadcastHeader>() as u32,
         device_type: DBT_DEVTYP_DEVICEINTERFACE,
         reserved: 0,
     };
-    let delivered = unsafe {
-        SendMessageW(
+    let mut answer = 0usize;
+    let sent = unsafe {
+        SendMessageTimeoutW(
             window,
             WM_DEVICECHANGE,
             DBT_DEVICEARRIVAL,
-            (&raw const header) as LPARAM,
+            (&raw const HEADER) as LPARAM,
+            SMTO_NORMAL,
+            SDL_DEVICE_CHANGE_TIMEOUT_MS,
+            &mut answer,
         )
     };
-    if delivered == 0 {
+    // A timeout is treated exactly like an undelivered message: the refresh is
+    // best effort, and reporting failure keeps the caller on its own recovery.
+    if sent == 0 || answer == 0 {
         return false;
     }
 
@@ -1994,6 +2014,7 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
         });
 
     let pipe_name = steam_input_lease_core::pipe_name(unsafe { GetCurrentProcessId() });
+    let mut pipe_failures = 0u32;
     loop {
         let pipe = unsafe {
             CreateNamedPipeW(
@@ -2008,8 +2029,19 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
             )
         };
         if pipe == INVALID_HANDLE_VALUE {
-            return 2;
+            // Retiring the server on one failure retires it for the life of the
+            // Steam process: the image is pinned, so DllMain never runs again
+            // and every later acquire only sees a missing pipe. Retry the
+            // transient causes (resource pressure, or the name momentarily held
+            // by another process) and give up only on a persistent failure.
+            pipe_failures += 1;
+            if pipe_failures >= PIPE_CREATE_MAX_FAILURES {
+                return 2;
+            }
+            thread::sleep(PIPE_CREATE_RETRY_DELAY);
+            continue;
         }
+        pipe_failures = 0;
         let connected = unsafe { ConnectNamedPipe(pipe, null_mut()) } != FALSE
             || unsafe { GetLastError() } == 535; // ERROR_PIPE_CONNECTED
         if !connected {

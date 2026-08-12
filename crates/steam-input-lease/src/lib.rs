@@ -85,6 +85,11 @@ pub use steam_input_lease_core::CAPABILITY_INTERNAL_RECOVERY;
 const MODULE_SNAPSHOT_LIMIT: usize = 512 * 1024 * 1024;
 const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
 
+// Bounded retries for a toolhelp module snapshot taken while Steam's loader
+// list is changing, and the linearly increasing pause between them.
+const MODULE_SNAPSHOT_ATTEMPTS: u32 = 5;
+const MODULE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 // Not exposed by the selected windows-sys API surface; value from the SDK.
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
 
@@ -201,6 +206,20 @@ impl RecoveryOutcome {
     }
 }
 
+/// Result of a completed [`Client::run_wrapped`]: the target ran to completion,
+/// and the final release either happened or failed afterwards.
+#[derive(Debug)]
+pub struct WrappedRun {
+    /// Exit code of the launched root process.
+    pub exit_code: u32,
+    /// The final release handshake. An `Err` here is deliberately NOT a run
+    /// failure — the game already exited, and reporting it as one made the
+    /// wrapper start the finished game a second time — but the caller should
+    /// report it, because a lease that did not recover leaves Steam without the
+    /// controller until the process dies.
+    pub release: std::result::Result<ReleaseOutcome, Error>,
+}
+
 /// Result of an explicit release. Blocking has been lifted whenever this is
 /// returned; [`ReleaseOutcome::recovery`] reports what happened afterwards.
 #[derive(Debug)]
@@ -304,12 +323,23 @@ impl Client {
     }
 
     /// Locates the configured target in the caller's Windows session.
+    ///
+    /// # Errors
+    /// [`Error::TargetNotFound`] when no process of that name runs in the
+    /// caller's session. Steam is simply not running; the caller should treat
+    /// the lease as unavailable rather than retry immediately.
     pub fn process_id(&self) -> Result<u32> {
         find_process(&self.options.target_name)
             .ok_or_else(|| Error::TargetNotFound(self.options.target_name.clone()))
     }
 
     /// Ensures that the payload is loaded, without acquiring a block lease.
+    ///
+    /// # Errors
+    /// Everything [`Client::acquire`] can return except that no lease is taken:
+    /// [`Error::TargetNotFound`], [`Error::PayloadNotFound`],
+    /// [`Error::ArchitectureMismatch`], [`Error::Windows`], [`Error::Message`]
+    /// or [`Error::Protocol`]. Nothing in Steam has been changed on failure.
     pub fn ensure_payload(&self) -> Result<Status> {
         let process_id = self.process_id()?;
         let pipe = self.connect_or_inject(process_id)?;
@@ -317,6 +347,12 @@ impl Client {
     }
 
     /// Queries an already loaded payload. This never injects.
+    ///
+    /// # Errors
+    /// [`Error::TargetNotFound`] when Steam is not running, [`Error::Windows`]
+    /// when the payload pipe does not answer within the short fixed probe
+    /// timeout, or [`Error::Protocol`] for an incompatible payload. A failure
+    /// means "no usable payload right now", never that blocking changed.
     pub fn status(&self) -> Result<Status> {
         let process_id = self.process_id()?;
         let pipe = connect_pipe(process_id, Duration::from_millis(500))?;
@@ -324,6 +360,16 @@ impl Client {
     }
 
     /// Acquires a crash-safe Steam Input block lease.
+    ///
+    /// # Errors
+    /// [`Error::TargetNotFound`] when Steam is not running,
+    /// [`Error::PayloadNotFound`] when injection was required but
+    /// `steam_input_gate.dll` is missing beside the caller,
+    /// [`Error::ArchitectureMismatch`] for a bitness mismatch,
+    /// [`Error::Windows`] for a failed Win32 step, [`Error::Message`] when the
+    /// payload loaded but its control pipe never appeared, or
+    /// [`Error::Protocol`] for an incompatible payload. No lease exists in any
+    /// of those cases, so the caller should fail open and run without one.
     pub fn acquire(&self) -> Result<Lease> {
         let process_id = self.process_id()?;
         let pipe = self.connect_or_inject(process_id)?;
@@ -342,10 +388,17 @@ impl Client {
     /// then resumed so quickly spawned descendants are included in the wait.
     /// Release is attempted even when process creation or waiting fails.
     ///
-    /// Returns the root process exit code after the final release handshake. An
-    /// error means the target never started, so the caller may safely launch it
-    /// itself; a failed release after a completed run is not an error.
-    pub fn run_wrapped<I, S>(&self, command: I) -> Result<u32>
+    /// Returns the root process exit code and the final release handshake.
+    ///
+    /// # Errors
+    /// [`Error::Message`] for an empty command, everything [`Client::acquire`]
+    /// can return, and [`Error::Windows`] when `CreateProcessW` fails. An error
+    /// means the target NEVER STARTED, so the caller may safely launch it
+    /// itself; a failed release after a completed run is deliberately not an
+    /// error, or the caller would start a finished game a second time — it is
+    /// reported through [`WrappedRun::release`] instead so the caller can still
+    /// log that Steam was left without controller recovery.
+    pub fn run_wrapped<I, S>(&self, command: I) -> Result<WrappedRun>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -368,7 +421,7 @@ impl Client {
             // during play often enough, and reporting it made the wrapper start the
             // finished game a second time. Blocking is lifted either way: the lease
             // is an open pipe connection that Windows drops with this process.
-            (Ok(exit_code), _) => Ok(exit_code),
+            (Ok(exit_code), release) => Ok(WrappedRun { exit_code, release }),
             (Err(launch_error), _) => Err(launch_error),
         }
     }
@@ -377,6 +430,14 @@ impl Client {
     ///
     /// This method does not acquire or release a block lease. It validates the
     /// runtime-resolved Steam object layout before writing the deadline.
+    ///
+    /// # Errors
+    /// [`Error::TargetNotFound`] when Steam is not running,
+    /// [`Error::UnsupportedSteamBuild`] when the layout or the live
+    /// `CHIDIOThread` could not be proven, or [`Error::Windows`] for a failed
+    /// read/write. Resolution is fail-closed, so a failure means the guarded
+    /// deadline write was skipped for that pass and controllers may stay
+    /// missing until Steam notices by itself; nothing else is ever written.
     pub fn rescan(&self) -> Result<RescanResult> {
         rescan_steam_controllers(self.process_id()?)
     }
@@ -385,6 +446,12 @@ impl Client {
     /// discovery target without changing controller state or acquiring a lease.
     /// This is the authoritative compatibility probe when the injected payload's
     /// in-process resolver is unavailable.
+    ///
+    /// # Errors
+    /// [`Error::TargetNotFound`], [`Error::UnsupportedSteamBuild`] when the
+    /// build's layout or live `CHIDIOThread` cannot be proven, or
+    /// [`Error::Windows`]. This probe writes nothing, so a failure is a
+    /// heads-up for the log and never a reason to abandon a lease.
     pub fn check_recovery(&self) -> Result<()> {
         resolve_remote_recovery(self.process_id()?).map(|_| ())
     }
@@ -446,6 +513,14 @@ impl Lease {
     /// without calling this method still closes the pipe and releases blocking,
     /// which remains the crash-safe path, but reports neither status nor
     /// recovery outcome.
+    ///
+    /// # Errors
+    /// [`Error::Windows`] when the release handshake could not be written or
+    /// read, or [`Error::Protocol`] for an incompatible response. Blocking has
+    /// been lifted in both cases because the pipe is already closed, so a
+    /// caller must log the failure and continue rather than retry the release.
+    /// A recovery failure is never reported here; see
+    /// [`ReleaseOutcome::recovery`].
     pub fn release(mut self) -> Result<ReleaseOutcome> {
         let pipe = self.pipe.take().expect("lease pipe must exist");
         let response = exchange(pipe.raw(), Command::ReleaseLease);
@@ -553,9 +628,16 @@ struct RemoteModule {
 
 fn remote_module(process_id: u32, module_name: &str) -> Option<RemoteModule> {
     // Toolhelp module snapshots can transiently return ERROR_BAD_LENGTH while
-    // the loader list changes, so retry that documented condition.
+    // the loader list changes, so retry that documented condition. Enumerating
+    // the fresh snapshot can fail for the same reason, so it retries too.
+    // Retries back off: without a pause every attempt lands inside the same
+    // loader mutation, and the caller then reports steamclient64.dll missing
+    // from a Steam that has plainly loaded it.
     unsafe {
-        for _ in 0..5 {
+        for attempt in 0..MODULE_SNAPSHOT_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(MODULE_SNAPSHOT_RETRY_DELAY * attempt);
+            }
             let snapshot = OwnedHandle::from_raw(CreateToolhelp32Snapshot(
                 TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
                 process_id,
@@ -569,7 +651,7 @@ fn remote_module(process_id: u32, module_name: &str) -> Option<RemoteModule> {
             let mut entry: MODULEENTRY32W = zeroed();
             entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
             if Module32FirstW(snapshot.raw(), &mut entry) == FALSE {
-                return None;
+                continue;
             }
             loop {
                 if wide_slice_to_string(&entry.szModule).eq_ignore_ascii_case(module_name) {
@@ -1104,7 +1186,12 @@ fn inject_payload(process_id: u32, payload: &Path) -> Result<()> {
             return Err(Error::windows("VirtualAllocEx failed"));
         }
 
-        let result = (|| {
+        // `remote_path` is the string the remote LoadLibraryW dereferences, so
+        // it may only be decommitted once that thread is known to be gone.
+        // Freeing it after a timed-out or unobservable wait would fault inside
+        // Steam; leaking one page in the target is strictly cheaper.
+        let mut remote_path_is_idle = true;
+        let mut inject = || {
             if WriteProcessMemory(
                 process.raw(),
                 remote_path,
@@ -1129,8 +1216,10 @@ fn inject_payload(process_id: u32, payload: &Path) -> Result<()> {
             if thread_handle.raw().is_null() {
                 return Err(Error::windows("CreateRemoteThread failed"));
             }
+            remote_path_is_idle = false;
             match WaitForSingleObject(thread_handle.raw(), 10_000) {
                 WAIT_OBJECT_0 => {
+                    remote_path_is_idle = true;
                     let mut module = 0;
                     if GetExitCodeThread(thread_handle.raw(), &mut module) == FALSE || module == 0 {
                         Err(Error::Message(
@@ -1143,8 +1232,11 @@ fn inject_payload(process_id: u32, payload: &Path) -> Result<()> {
                 WAIT_TIMEOUT => Err(Error::Message("payload injection timed out".into())),
                 _ => Err(Error::windows("waiting for payload injection failed")),
             }
-        })();
-        VirtualFreeEx(process.raw(), remote_path, 0, MEM_RELEASE);
+        };
+        let result = inject();
+        if remote_path_is_idle {
+            VirtualFreeEx(process.raw(), remote_path, 0, MEM_RELEASE);
+        }
         result
     }
 }

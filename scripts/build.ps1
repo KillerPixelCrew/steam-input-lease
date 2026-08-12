@@ -9,16 +9,19 @@ beside the CLI (for direct execution) and under native/ (for embedding).
 
 .PARAMETER Runtime
 Artifact directory label. This script currently builds the active Rust target,
-so the default win-x64 must only be changed when the shell/toolchain target is
-changed accordingly.
+so the value is constrained to win-x64; widen the ValidateSet only when the
+shell/toolchain target is changed accordingly.
 
 .OUTPUTS
 artifacts/<Runtime> and artifacts/packages/SteamInputLease.<version>.nupkg.
 #>
+[CmdletBinding()]
 param(
+    [ValidateSet('win-x64')]
     [string]$Runtime = 'win-x64'
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $workspace 'Cargo.toml'

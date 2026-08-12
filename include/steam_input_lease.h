@@ -108,11 +108,15 @@ typedef struct SilReleaseOutcome {
 } SilReleaseOutcome;
 
 /**
- * @return The C ABI version, currently 2.
+ * @return The C ABI version, currently 3.
  *
  * Version 2 changed sil_lease_release() to report a SilReleaseOutcome instead
  * of a bare SilStatus, so a recovery failure no longer presents a released
  * lease as a failed one.
+ *
+ * Version 3 added the release output to sil_client_run_wrapped(), which
+ * previously discarded the final handshake — a wrapped game could leave Steam
+ * without controller recovery and nothing could report it.
  */
 SIL_API uint32_t sil_abi_version(void);
 
@@ -182,12 +186,24 @@ SIL_API int32_t sil_client_check_recovery(SilClient* client);
 /**
  * Runs an executable/argument vector under a lease, waits for its Windows job
  * process tree, releases the lease, then writes the root process exit code.
+ *
+ * A returned SIL_ERROR means the target NEVER STARTED, so the caller may
+ * safely launch it itself. A release handshake that fails after the run has
+ * already completed is deliberately not an error: reporting it would make a
+ * fail-open caller start a finished program a second time.
+ *
+ * @param release Optional; pass NULL to ignore the final handshake. When
+ *        supplied and the handshake failed, recovery is
+ *        SIL_RECOVERY_UNAVAILABLE and recovery_message carries the reason —
+ *        the caller should log it, because Steam was then left without
+ *        controller recovery until this process exits.
  */
 SIL_API int32_t sil_client_run_wrapped(
     SilClient* client,
     size_t argc,
     const uint16_t* const* argv,
-    uint32_t* exit_code);
+    uint32_t* exit_code,
+    SilReleaseOutcome* release);
 
 /*
  * The ABI intentionally has no detach/unload call. The injected payload is

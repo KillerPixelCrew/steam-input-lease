@@ -1,21 +1,35 @@
 namespace SteamInterop;
 
-/// <summary>Configuration for locating a target process and injected Rust payload.</summary>
+/// <summary>Configuration for locating a target process and its Rust payload.</summary>
 /// <remarks>
 /// The production defaults target the current-session <c>steam.exe</c> and a
-/// payload beside the managed application's executable. Host and target
-/// architectures and integrity levels must match.
+/// payload Steam loaded itself, as a search-order proxy DLL deployed into its
+/// own install directory. Injection is opt-in through
+/// <see cref="AllowInjection"/>; host and target architectures and integrity
+/// levels must match on that path.
 /// </remarks>
 public sealed class SteamInputClientOptions
 {
     /// <summary>Gets the executable name of the process receiving the payload.</summary>
     public string TargetName { get; init; } = "steam.exe";
 
-    /// <summary>Gets the path to <c>steam_input_gate.dll</c>.</summary>
+    /// <summary>Gets the path to <c>steam_input_gate.dll</c>, used only when
+    /// <see cref="AllowInjection"/> is set.</summary>
     public string PayloadPath { get; init; } = Path.Combine(AppContext.BaseDirectory, "steam_input_gate.dll");
 
-    /// <summary>Gets the maximum control-pipe startup wait after injection.</summary>
+    /// <summary>Gets the maximum control-pipe startup wait.</summary>
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Gets whether this client may inject the payload when no resident
+    /// one answers.</summary>
+    /// <remarks>
+    /// Defaults to <see langword="false"/>. The payload is normally delivered as
+    /// a proxy DLL Steam loads from its own directory, and a client that cannot
+    /// reach one is expected to fail open rather than write into Steam. Only the
+    /// per-game launch wrapper opts in, and only when the user has Steam Input
+    /// Management turned off, because then no resident payload exists.
+    /// </remarks>
+    public bool AllowInjection { get; init; }
 }
 
 /// <summary>A process-wide payload status snapshot.</summary>

@@ -26,6 +26,7 @@ public sealed class SteamInputClient : IDisposable
                 TargetName = targetName,
                 PayloadPath = payloadPath,
                 ConnectTimeoutMilliseconds = checked((uint)options.ConnectTimeout.TotalMilliseconds),
+                AllowInjection = options.AllowInjection ? 1u : 0u,
             };
             NativeMethods.ThrowIfFailed(
                 NativeMethods.sil_client_create(in nativeOptions, out nint client));

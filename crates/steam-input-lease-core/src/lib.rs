@@ -40,6 +40,10 @@ pub enum ResultCode {
     Ok = 0,
     /// The request header, protocol version, or command was invalid.
     InvalidRequest = 1,
+    /// The payload could not install its hooks, so no lease can be granted.
+    /// Hooks are installed on the first acquire rather than at load, so this is
+    /// the first point at which that failure can be reported.
+    HookInstallFailed = 2,
 }
 
 /// Fixed-size request header sent from a host client to the payload.

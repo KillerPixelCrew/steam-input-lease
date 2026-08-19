@@ -26,7 +26,13 @@ fn usage() {
 }
 
 fn run() -> Result<u32, String> {
-    let mut options = ClientOptions::default();
+    // The diagnostic tool keeps the injection path reachable: it is how the
+    // injected delivery route stays testable now that every shipped caller
+    // defaults to a payload Steam loaded itself.
+    let mut options = ClientOptions {
+        allow_injection: true,
+        ..ClientOptions::default()
+    };
     let mut command = Vec::<OsString>::new();
     let mut after_separator = false;
     let mut status_only = false;

@@ -16,6 +16,12 @@ internal static class NativeMethods
         internal nint TargetName;
         internal nint PayloadPath;
         internal uint ConnectTimeoutMilliseconds;
+
+        // ABI 4. Non-zero lets the client inject the payload when no resident
+        // one answers; zero restricts it to a payload Steam loaded itself from
+        // its own directory. WSGM leaves this zero everywhere, so its own
+        // surfaces cannot write into the Steam process at all.
+        internal uint AllowInjection;
     }
 
     [StructLayout(LayoutKind.Sequential)]

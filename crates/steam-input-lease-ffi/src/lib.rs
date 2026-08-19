@@ -40,10 +40,15 @@ thread_local! {
 pub struct SilClientOptions {
     /// Optional NUL-terminated UTF-16 target executable name.
     pub target_name: *const u16,
-    /// Optional NUL-terminated UTF-16 payload path.
+    /// Optional NUL-terminated UTF-16 payload path. Consulted ONLY when
+    /// `allow_injection` is non-zero.
     pub payload_path: *const u16,
     /// Pipe connection timeout in milliseconds; zero selects the default.
     pub connect_timeout_ms: u32,
+    /// Non-zero to let this client inject the payload when no resident one
+    /// answers. Zero - the default - restricts it to a payload Steam loaded
+    /// itself, which is how WSGM's own surfaces always run.
+    pub allow_injection: u32,
 }
 
 /// Fixed-width payload status returned across the C ABI.
@@ -241,7 +246,7 @@ unsafe fn client_ref<'a>(client: *mut SilClient) -> Result<&'a Client, String> {
 /// instead of a bare [`SilStatus`]. Version `3` added the `release` output to
 /// `sil_client_run_wrapped`, which previously discarded the final handshake.
 pub extern "C" fn sil_abi_version() -> u32 {
-    3
+    4
 }
 
 #[unsafe(no_mangle)]
@@ -281,6 +286,7 @@ pub unsafe extern "C" fn sil_client_create(
             if options.connect_timeout_ms != 0 {
                 resolved.connect_timeout = Duration::from_millis(options.connect_timeout_ms.into());
             }
+            resolved.allow_injection = options.allow_injection != 0;
         }
         unsafe { *output = Box::into_raw(Box::new(SilClient(Client::new(resolved)))) };
         Ok(())

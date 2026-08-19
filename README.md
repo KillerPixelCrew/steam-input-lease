@@ -54,9 +54,22 @@ quoting itself. The lease is held for as long as the game's process tree lives.
 
 It changes controller access **inside the Steam process only**. It does not
 inject into the game, disable the Steam Overlay, restart or terminate Steam,
-install a driver, hide a controller from Windows, drop a proxy DLL into Steam's
-directory, modify Steam files on disk, or stop any other application from
-opening controllers.
+install a driver, hide a controller from Windows, or stop any other application
+from opening controllers.
+
+It *is* delivered as a proxy DLL in Steam's own install directory. The payload
+is deployed under a name Steam resolves through the default DLL search order
+(`XInput1_4.dll`, falling back to `dinput8.dll`), so **Steam loads it itself and
+nothing writes into the Steam process**. The vector is only a door: every export
+forwards to the real module in System32, and once the image is mapped the same
+process-wide hooks run as before. A deployed proxy is inert until a lease is
+taken, so a machine where the file is present but nothing holds a lease behaves
+exactly like one where it is absent.
+
+Injection remains implemented and is reachable only by opting in through
+`allow_injection` (C ABI version 4). It exists for the per-game launch wrapper on
+systems where the proxy is not deployed, and for this crate's own diagnostic
+CLI. Every other caller is left at the default and cannot inject.
 
 While a lease is held, Steam sees the same class of failures it would see if the
 controller had been unplugged. The controller stays available to everything

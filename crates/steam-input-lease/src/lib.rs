@@ -105,16 +105,25 @@ const LIVE_ELECTION_INTERVAL: Duration = Duration::from_millis(125);
 // are serialized by the callers that resolve recovery.
 static NOTIFY_TARGET: AtomicU32 = AtomicU32::new(0);
 
-/// Configuration used to locate Steam and inject the payload.
+/// Configuration used to locate Steam and reach the payload.
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
     /// Executable name of the target process in the caller's Windows session.
     /// The production default is `steam.exe`.
     pub target_name: String,
-    /// Absolute or relative path of the injected `steam_input_gate.dll`.
+    /// Absolute or relative path of `steam_input_gate.dll`, used ONLY when
+    /// [`ClientOptions::allow_injection`] is set.
     pub payload_path: PathBuf,
-    /// Maximum time to wait for the payload pipe after successful injection.
+    /// Maximum time to wait for the payload pipe.
     pub connect_timeout: Duration,
+    /// Whether this client may inject the payload when no resident one answers.
+    ///
+    /// Defaults to `false`: the payload is normally delivered as a search-order
+    /// proxy DLL that Steam loads itself, and a client that cannot reach one is
+    /// expected to fail open rather than write into Steam's process. Only the
+    /// per-game launch wrapper opts in, and only when the user has Steam Input
+    /// Management turned off, because then no resident payload exists to reach.
+    pub allow_injection: bool,
 }
 
 impl Default for ClientOptions {
@@ -128,6 +137,7 @@ impl Default for ClientOptions {
             target_name: "steam.exe".into(),
             payload_path,
             connect_timeout: Duration::from_secs(10),
+            allow_injection: false,
         }
     }
 }
@@ -342,7 +352,7 @@ impl Client {
     /// or [`Error::Protocol`]. Nothing in Steam has been changed on failure.
     pub fn ensure_payload(&self) -> Result<Status> {
         let process_id = self.process_id()?;
-        let pipe = self.connect_or_inject(process_id)?;
+        let pipe = self.connect(process_id)?;
         exchange(pipe.raw(), Command::QueryStatus).map(Status::from)
     }
 
@@ -372,7 +382,7 @@ impl Client {
     /// of those cases, so the caller should fail open and run without one.
     pub fn acquire(&self) -> Result<Lease> {
         let process_id = self.process_id()?;
-        let pipe = self.connect_or_inject(process_id)?;
+        let pipe = self.connect(process_id)?;
         let response = exchange(pipe.raw(), Command::AcquireLease)?;
         Ok(Lease {
             pipe: Some(pipe),
@@ -461,6 +471,28 @@ impl Client {
     // spawns a worker, then loops back to CreateNamedPipeW. That gap is one
     // CreateNamedPipeW plus one CreateThread, so a handful of retries is ample.
     // Concluding "not injected" too early costs a redundant re-injection.
+    /// Reaches the payload the way this client is configured to.
+    ///
+    /// This is the single choke point that decides whether injection can happen
+    /// at all, so a caller cannot reach `connect_or_inject` by accident.
+    fn connect(&self, process_id: u32) -> Result<OwnedHandle> {
+        if self.options.allow_injection {
+            self.connect_or_inject(process_id)
+        } else {
+            self.connect_only(process_id)
+        }
+    }
+
+    /// Connects to a payload Steam already loaded, and never injects.
+    fn connect_only(&self, process_id: u32) -> Result<OwnedHandle> {
+        connect_pipe(process_id, self.options.connect_timeout).map_err(|_| {
+            Error::Message(
+                "no resident Steam Input payload answered; Steam Input Management is off,                  its proxy is not deployed, or Steam has not restarted since it was"
+                    .into(),
+            )
+        })
+    }
+
     fn connect_or_inject(&self, process_id: u32) -> Result<OwnedHandle> {
         if let Ok(pipe) = connect_pipe(process_id, Duration::from_millis(20)) {
             return Ok(pipe);

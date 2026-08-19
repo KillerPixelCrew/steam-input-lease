@@ -45,9 +45,18 @@ typedef struct SilClientOptions {
     /** Target executable name, or NULL to use "steam.exe". */
     const uint16_t* target_name;
     /** Payload DLL path, or NULL to use the executable-directory default. */
+    /* Consulted ONLY when allow_injection is non-zero. */
     const uint16_t* payload_path;
     /** Pipe startup timeout in milliseconds, or zero for the default. */
     uint32_t connect_timeout_ms;
+    /*
+     * Non-zero to let this client inject the payload when no resident one
+     * answers. Zero - the default - restricts the client to a payload Steam
+     * loaded itself as a search-order proxy DLL from its own directory, which
+     * is how every WSGM surface runs. Only the per-game launch wrapper sets
+     * this, and only when the user has Steam Input Management turned off.
+     */
+    uint32_t allow_injection;
 } SilClientOptions;
 
 /** Process-global payload status snapshot. */
@@ -108,11 +117,16 @@ typedef struct SilReleaseOutcome {
 } SilReleaseOutcome;
 
 /**
- * @return The C ABI version, currently 3.
+ * @return The C ABI version, currently 4.
  *
  * Version 2 changed sil_lease_release() to report a SilReleaseOutcome instead
  * of a bare SilStatus, so a recovery failure no longer presents a released
  * lease as a failed one.
+ *
+ * Version 4 added allow_injection to SilClientOptions and made proxy delivery
+ * the default: the payload is normally a search-order DLL Steam loads from its
+ * own directory, so payload_path and connect_timeout_ms only govern the opt-in
+ * injection path. A client left at the defaults can never write into Steam.
  *
  * Version 3 added the release output to sil_client_run_wrapped(), which
  * previously discarded the final handshake — a wrapped game could leave Steam

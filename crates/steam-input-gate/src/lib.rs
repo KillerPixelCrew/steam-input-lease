@@ -50,12 +50,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATEFILE2_EXTENDED_PARAMETERS, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN,
     GetFileType, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Diagnostics::Debug::{OutputDebugStringW, ReadProcessMemory};
 use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::LibraryLoader::{
     DisableThreadLibraryCalls, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-    GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExW, GetModuleHandleW, GetProcAddress,
-    LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
+    GetProcAddress,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
@@ -71,6 +71,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetWindowThreadProcessId, PostMessageW, SMTO_NORMAL,
     SendMessageTimeoutW, WM_DEVICECHANGE,
 };
+
+mod proxy;
+
+use proxy::{classify_vector, record_self_module};
 
 // Win32/NT constants that windows-sys does not expose through the selected API
 // surface. Values come from the Windows SDK headers used by the archived POC.
@@ -1038,8 +1042,14 @@ unsafe fn queue_hook(
 }
 
 unsafe fn install_xinput_module(index: usize, module_name: &str) {
-    let wide: Vec<u16> = module_name.encode_utf16().chain(Some(0)).collect();
-    let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    // Resolve by FULL System32 path, never by base name. Once this payload is
+    // resident in Steam's directory as xinput1_4.dll, a bare-name load returns
+    // THIS module however it is flagged - the loader keys already-loaded modules
+    // by base name, so LOAD_LIBRARY_SEARCH_SYSTEM32 never gets to search - and
+    // the gate would detour its own proxy forwarders. `load_system32_module`
+    // additionally returns null when the result is us, so the guard fails closed
+    // while our own handle is still unknown.
+    let module = unsafe { proxy::load_system32_module(module_name) };
     if module.is_null() {
         return;
     }
@@ -1918,6 +1928,9 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
     let result = if !valid {
         ResultCode::InvalidRequest
     } else if request.command == Command::AcquireLease as u16 {
+        if !ensure_hooks_installed() {
+            ResultCode::HookInstallFailed
+        } else {
         let leases = LEASE_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
         lease = true;
         if leases == 1 {
@@ -1927,6 +1940,7 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
             discover_and_revoke_hid_handles();
         }
         ResultCode::Ok
+        }
     } else if request.command == Command::QueryStatus as u16 {
         ResultCode::Ok
     } else {
@@ -1987,6 +2001,62 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
     0
 }
 
+/// Emits the one line that says how this payload got into the process.
+///
+/// Out of band on purpose: the wire `Response` is a fixed 24-byte struct with no
+/// spare field, and the host does not need the vector over the pipe - it already
+/// knows which name it deployed and learns whether that name took from the pipe
+/// existing at all. This line is the human-facing half, readable in DebugView on
+/// a device where nothing else is attached.
+fn report_load_vector(module: HMODULE) {
+    let mut buffer = [0u16; 260];
+    let length =
+        unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&buffer[..length.min(buffer.len())]);
+    let file_name = path
+        .rsplit(std::path::MAIN_SEPARATOR)
+        .next()
+        .unwrap_or_default();
+    let vector = classify_vector(file_name);
+    let message = format!("WSGM SteamInputGate loaded: vector={}\n", vector.label());
+    let wide: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    unsafe { OutputDebugStringW(wide.as_ptr()) };
+}
+
+/// Installs the detours the first time a lease is asked for.
+///
+/// Deliberately not done at load: as a search-order proxy this DLL is mapped
+/// during Steam's own startup, and having NtCreateFile/NtReadFile detoured
+/// through Steam's client-verification pass hung it on a cold boot straight
+/// after an install (device-observed 2026-08-19). Everything stays inert until
+/// WSGM asks for a block.
+///
+/// Idempotent and serialized: several surfaces can acquire at once, and MinHook
+/// must initialize exactly once. A failure is remembered as "attempted" so a
+/// broken environment does not retry an expensive install on every acquire.
+fn ensure_hooks_installed() -> bool {
+    static STATE: Mutex<Option<bool>> = Mutex::new(None);
+    let mut state = match STATE.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(installed) = *state {
+        return installed;
+    }
+    let installed = unsafe { install_hooks() };
+    *state = Some(installed);
+    if installed {
+        // Warm the recovery layout only now. It sweeps Steam's address space, so
+        // at load it would be one more thing competing with Steam's own startup.
+        let _ = thread::Builder::new()
+            .name("steam-input-gate-warmup".into())
+            .spawn(|| {
+                let _ = resolve_discovery_deadline(false);
+            });
+    }
+    installed
+}
+
 unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
     let mut pinned: HMODULE = null_mut();
     // Pinning prevents the Windows loader from unmapping code still referenced
@@ -1998,20 +2068,27 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
             &mut pinned,
         )
     };
-    if !unsafe { install_hooks() } {
-        return 1;
-    }
+    // The self-identity guard must know our handle BEFORE any hook is installed:
+    // `install_xinput_module` refuses to detour a module that is us, and it fails
+    // closed while the handle is still unknown, so recording it here is what lets
+    // the real System32 XInput module be hooked at all.
+    record_self_module(pinned);
+    report_load_vector(pinned);
+    // Hooks are NOT installed here. As a proxy this DLL loads during Steam's own
+    // startup, and detouring NtCreateFile/NtReadFile that early puts our code in
+    // front of Steam's client-verification pass - a cold boot right after an
+    // install hung Steam there (device-observed 2026-08-19). Injection never had
+    // this exposure because it happened with Steam already up. Installing on the
+    // first lease keeps the payload completely inert until WSGM actually asks for
+    // a block, which also makes the pass-through guarantee trivially true: there
+    // is no detour to pass through.
+
     // Warm RECOVERY_LAYOUT and HID_THREAD_ADDRESS so the first acquire's
     // response() costs a few reads instead of a full address-space sweep. It runs
     // on its own thread because the control pipe must not wait for it: the sweep
     // can take seconds, and a host querying status uses a short fixed timeout and
     // never injects, so serialising the two would make a loaded payload look
     // absent. Placed after install_hooks so the trampolines are live.
-    let _ = thread::Builder::new()
-        .name("steam-input-gate-warmup".into())
-        .spawn(|| {
-            let _ = resolve_discovery_deadline(false);
-        });
 
     let pipe_name = steam_input_lease_core::pipe_name(unsafe { GetCurrentProcessId() });
     let mut pipe_failures = 0u32;

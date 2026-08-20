@@ -92,9 +92,12 @@ pub(crate) fn record_self_module(module: HMODULE) {
 
 /// True when `module` is this very image.
 ///
-/// Fails CLOSED while the handle is still unknown: before the server thread has
-/// recorded it, every candidate is treated as possibly-us, so no hook is ever
-/// installed onto our own forwarders during startup.
+/// Fails CLOSED while the handle is still unknown, so no hook is ever installed
+/// onto our own forwarders. `DllMain` records the handle before anything can
+/// reach this, and that ordering is load-bearing rather than tidy: while the
+/// handle was unknown this rejected the real System32 module on every call,
+/// nothing was cached, and the resulting `LoadLibraryExW` storm on Steam's
+/// startup thread hung Steam on every cold boot. See the note in `DllMain`.
 fn is_self(module: HMODULE) -> bool {
     let recorded = SELF_MODULE.load(Ordering::Acquire);
     recorded == 0 || recorded == module as usize

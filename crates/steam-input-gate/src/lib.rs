@@ -2144,6 +2144,26 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
 /// Called only by the Windows loader with its documented `DllMain` arguments.
 pub unsafe extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _: *mut c_void) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
+        // Record our own handle FIRST, from the one the loader just handed us.
+        //
+        // This one store is what stopped Steam hanging on EVERY cold boot with the
+        // proxy deployed (device-verified 2026-08-20: 100% before, 0 in 10 boots
+        // after). The server thread also records it, but it cannot run until the
+        // loader lock is released, and until the handle is known `proxy::is_self`
+        // fails CLOSED - so during that window `load_system32_module` performed a
+        // full `LoadLibraryExW` of the real System32 XInput, rejected the result as
+        // possibly-us, and returned null WITHOUT caching anything. Every XInput call
+        // therefore repeated the whole load, and SDL probes four user indices and
+        // retries: a burst of full loader transactions on Steam's own startup
+        // thread, contending the very lock the server thread needed in order to end
+        // the window. Which side won was a race, and losing it wedged Steam
+        // completely - unkillable by `steam://exit`, Task Manager required.
+        //
+        // The HINSTANCE passed to DllMain IS this image's base address, so closing
+        // the window costs nothing and adds no loader call. Never move this back to
+        // the server thread, and never make the identity guard the only thing that
+        // decides whether the real module gets cached.
+        record_self_module(instance as HMODULE);
         // Keep loader-lock work minimal. All allocation, hook installation, and
         // pipe setup occurs asynchronously on server_thread.
         unsafe { DisableThreadLibraryCalls(instance) };

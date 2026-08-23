@@ -37,10 +37,23 @@ $launcher = Join-Path $output 'steam-input-lease.exe'
 $payload = Join-Path $output 'steam_input_gate.dll'
 $target = Join-Path $output 'steam-input-test-target.exe'
 $port = Get-Random -Minimum 40000 -Maximum 60000
+$traceDirectory = Join-Path ([System.IO.Path]::GetTempPath()) `
+    "wsgm-steam-input-test-$PID-$([Guid]::NewGuid().ToString('N'))"
+$resolvedTraceDirectory = [System.IO.Path]::GetFullPath($traceDirectory)
+$resolvedTempDirectory = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+if (-not $resolvedTraceDirectory.StartsWith(
+        $resolvedTempDirectory,
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to create test trace directory outside the system temp directory"
+}
+New-Item -ItemType Directory -Path $resolvedTraceDirectory | Out-Null
+$previousTraceDirectory = $env:WSGM_STEAM_INPUT_TRACE_DIR
+$env:WSGM_STEAM_INPUT_TRACE_DIR = $resolvedTraceDirectory
 # The server performs CreateFileW inside the injected process when a tiny local
 # TCP client asks it to probe the deliberately nonexistent HID-style path.
-$targetProcess = Start-Process -FilePath $target -ArgumentList '--serve', $port -WindowStyle Hidden -PassThru
+$targetProcess = $null
 try {
+    $targetProcess = Start-Process -FilePath $target -ArgumentList '--serve', $port -WindowStyle Hidden -PassThru
     # Poll for readiness instead of assuming a fixed bind time: on a loaded or
     # cold machine a slow listener would otherwise surface as a gate failure and
     # blame the injected payload for a harness race.
@@ -83,14 +96,28 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Payload status query returned $LASTEXITCODE"
     }
+
+    $trace = Get-ChildItem -LiteralPath $resolvedTraceDirectory `
+        -Filter 'steam-input-gate-*.log' | Select-Object -First 1
+    if ($null -eq $trace) {
+        throw "Injected payload did not produce its isolated startup trace"
+    }
+    $traceContent = Get-Content -LiteralPath $trace.FullName -Raw
+    if ($traceContent -notmatch 'control pipe listening') {
+        throw "Startup trace did not reach control-pipe readiness"
+    }
 } finally {
-    $targetProcess.Refresh()
-    if (-not $targetProcess.HasExited) {
-        Stop-Process -Id $targetProcess.Id
+    if ($null -ne $targetProcess) {
+        $targetProcess.Refresh()
+        if (-not $targetProcess.HasExited) {
+            Stop-Process -Id $targetProcess.Id
+        }
+        # Bounded: a Stop-Process that could not reach the target (protected or
+        # elevated) must not wedge the script in cleanup with no diagnostic.
+        if (-not $targetProcess.WaitForExit(5000)) {
+            Write-Warning "Test target $($targetProcess.Id) did not exit within 5s after Stop-Process"
+        }
     }
-    # Bounded: a Stop-Process that could not reach the target (protected or
-    # elevated) must not wedge the script in cleanup with no diagnostic.
-    if (-not $targetProcess.WaitForExit(5000)) {
-        Write-Warning "Test target $($targetProcess.Id) did not exit within 5s after Stop-Process"
-    }
+    $env:WSGM_STEAM_INPUT_TRACE_DIR = $previousTraceDirectory
+    Remove-Item -LiteralPath $resolvedTraceDirectory -Recurse -Force
 }

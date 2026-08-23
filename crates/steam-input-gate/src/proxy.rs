@@ -14,6 +14,16 @@
 //! nothing in Steam's directory statically imports XInput or DirectInput, so a
 //! missing export degrades a `GetProcAddress` to NULL instead of failing a load.
 //!
+//! ## The bootstrap block
+//!
+//! ValvePlug starts blocked, so Steam's startup probes return immediately and
+//! never enter the Windows loader through a proxy forwarder. WSGM needs dynamic
+//! blocking, but must preserve that safe startup property: every export fails
+//! closed until the server thread has resolved and cached every real System32
+//! target exactly once. Only then does one release store make the forwarders
+//! pass through. No Steam startup thread ever loads a module or resolves an
+//! export on WSGM's behalf.
+//!
 //! ## The self-recursion hazard
 //!
 //! `LOAD_LIBRARY_SEARCH_SYSTEM32` does NOT protect against loading ourselves.
@@ -25,13 +35,15 @@
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-use windows_sys::Win32::Foundation::{ERROR_DEVICE_NOT_CONNECTED, HMODULE};
+use windows_sys::Win32::Foundation::{ERROR_DEVICE_NOT_CONNECTED, FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
 use super::blocking;
+use super::startup_trace;
 
 /// Which file name Steam loaded this payload under.
 ///
@@ -79,7 +91,7 @@ pub(crate) fn classify_vector(file_name: &str) -> Vector {
     }
 }
 
-/// This module's own handle, recorded once the server thread has pinned it.
+/// This module's own handle, recorded and pinned during process attach.
 ///
 /// Stored as a `usize` because `HMODULE` is a raw pointer and this is only ever
 /// compared for identity, never dereferenced.
@@ -106,7 +118,8 @@ fn is_self(module: HMODULE) -> bool {
 /// Loads a system module by FULL System32 path, never by base name.
 ///
 /// Returns null when the module cannot be loaded, or when it resolves to this
-/// image - see the self-recursion note at the top of this file.
+/// image - see the self-recursion note at the top of this file. A rejected load
+/// is balanced immediately; the proxy never leaks a module reference.
 pub(crate) unsafe fn load_system32_module(name: &str) -> HMODULE {
     let mut buffer = [0u16; 260];
     let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
@@ -118,7 +131,11 @@ pub(crate) unsafe fn load_system32_module(name: &str) -> HMODULE {
     path.extend(name.encode_utf16());
     path.push(0);
     let module = unsafe { LoadLibraryExW(path.as_ptr(), null_mut(), 0) };
-    if module.is_null() || is_self(module) {
+    if module.is_null() {
+        return null_mut();
+    }
+    if is_self(module) {
+        unsafe { FreeLibrary(module) };
         return null_mut();
     }
     module
@@ -128,52 +145,11 @@ pub(crate) unsafe fn load_system32_module(name: &str) -> HMODULE {
 static REAL_XINPUT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 /// Caches the real `System32\dinput8.dll` this proxy forwards to.
 static REAL_DINPUT8: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-
-/// Resolves and caches a real system module.
-///
-/// Resolution is LAZY on purpose. Steam can call through a forwarder before the
-/// server thread has run, and `DllMain` must not load libraries under the loader
-/// lock, so the first call through any export is what pulls the real DLL in.
-unsafe fn real_module(cache: &AtomicPtr<c_void>, name: &str) -> HMODULE {
-    let cached = cache.load(Ordering::Acquire);
-    if !cached.is_null() {
-        return cached.cast();
-    }
-    let module = unsafe { load_system32_module(name) };
-    if !module.is_null() {
-        cache.store(module.cast(), Ordering::Release);
-    }
-    module
-}
-
-/// Resolves an export of a real system module, caching the address.
-///
-/// `export` is either a NUL-terminated name or an ordinal cast to a pointer,
-/// matching `GetProcAddress`'s own overloading.
-unsafe fn real_export(
-    slot: &AtomicPtr<c_void>,
-    module_cache: &AtomicPtr<c_void>,
-    module_name: &str,
-    export: *const u8,
-) -> *mut c_void {
-    let cached = slot.load(Ordering::Acquire);
-    if !cached.is_null() {
-        return cached;
-    }
-    let module = unsafe { real_module(module_cache, module_name) };
-    if module.is_null() {
-        return null_mut();
-    }
-    let address = unsafe { GetProcAddress(module, export) };
-    match address {
-        Some(function) => {
-            let pointer = function as *mut c_void;
-            slot.store(pointer, Ordering::Release);
-            pointer
-        }
-        None => null_mut(),
-    }
-}
+/// One-shot result for proxy initialization. A failed resolve is cached so
+/// Steam startup can never provoke an unbounded retry loop.
+static FORWARDING_INITIALIZATION: OnceLock<bool> = OnceLock::new();
+/// Release flag observed by every proxy export before it reads a target slot.
+static FORWARDING_READY: AtomicBool = AtomicBool::new(false);
 
 /// File name of the real XInput module this proxy stands in front of.
 const XINPUT_MODULE: &str = "XInput1_4.dll";
@@ -184,6 +160,111 @@ const DINPUT8_MODULE: &str = "dinput8.dll";
 /// unreachable. Failing the call is correct: the alternative is pretending an
 /// interface was created and handing the caller an uninitialised pointer.
 const E_FAIL: i32 = -2_147_467_259;
+
+/// True only after the worker cached the complete forwarding table.
+fn forwarding_ready() -> bool {
+    FORWARDING_READY.load(Ordering::Acquire)
+}
+
+/// Resolves one real-system export into its permanent target slot.
+unsafe fn cache_export(slot: &AtomicPtr<c_void>, module: HMODULE, export: *const u8) -> bool {
+    let Some(function) = (unsafe { GetProcAddress(module, export) }) else {
+        return false;
+    };
+    slot.store(function as *mut c_void, Ordering::Release);
+    true
+}
+
+/// Resolves a forwarding table best-effort, answering how many entries failed.
+///
+/// Deliberately NOT `.all()`: that short-circuits, so one absent ordinal (108
+/// `XInputGetCapabilitiesEx` is not present on every Windows SKU) would leave the
+/// whole table unresolved and, because `FORWARDING_INITIALIZATION` caches the
+/// verdict and the image is pinned, would kill every controller entry point in that
+/// `steam.exe` for the life of the process. Each thunk already falls back
+/// correctly on its own null slot, so an unresolved entry must cost only itself.
+unsafe fn cache_exports(module: HMODULE, exports: &[(&AtomicPtr<c_void>, *const u8)]) -> usize {
+    exports
+        .iter()
+        .filter(|(slot, export)| !unsafe { cache_export(slot, module, *export) })
+        .count()
+}
+
+/// Resolves the entries a vector cannot degrade without, answering whether the
+/// vector is usable at all. These are the named exports Steam actually calls on
+/// every frame; anything beyond them is optional and may stay null.
+unsafe fn cache_required(
+    module: HMODULE,
+    required: &[(&AtomicPtr<c_void>, *const u8)],
+    optional: &[(&AtomicPtr<c_void>, *const u8)],
+) -> bool {
+    let missing_required = unsafe { cache_exports(module, required) };
+    let missing_optional = unsafe { cache_exports(module, optional) };
+    startup_trace::mark_exports_resolved(missing_required, missing_optional);
+    missing_required == 0
+}
+
+/// Resolves every proxy forwarder on the worker, then releases the bootstrap block.
+///
+/// The `OnceLock` remembers both success and failure. Steam's own call paths only
+/// observe `FORWARDING_READY`; they never initialize or retry this work.
+pub(crate) fn initialize_forwarding(vector: Vector) -> bool {
+    *FORWARDING_INITIALIZATION.get_or_init(|| {
+        let initialized = match vector {
+            Vector::XInput14 => {
+                let module = unsafe { load_system32_module(XINPUT_MODULE) };
+                if module.is_null() {
+                    false
+                } else {
+                    REAL_XINPUT.store(module.cast(), Ordering::Release);
+                    // Required: the three Steam calls on every frame. Optional: the
+                    // undocumented ordinals, which are absent on some SKUs and must
+                    // degrade one slot at a time rather than sink the vector.
+                    let required = [
+                        (&XINPUT_GET_STATE, c"XInputGetState".as_ptr().cast()),
+                        (&XINPUT_GET_CAPABILITIES, c"XInputGetCapabilities".as_ptr().cast()),
+                        (&XINPUT_SET_STATE, c"XInputSetState".as_ptr().cast()),
+                    ];
+                    let optional = [
+                        (&XINPUT_BATTERY, c"XInputGetBatteryInformation".as_ptr().cast()),
+                        (&XINPUT_KEYSTROKE, c"XInputGetKeystroke".as_ptr().cast()),
+                        (&XINPUT_AUDIO, c"XInputGetAudioDeviceIds".as_ptr().cast()),
+                        (&XINPUT_ENABLE, c"XInputEnable".as_ptr().cast()),
+                        (&XINPUT_STATE_EX, 100usize as *const u8),
+                        (&XINPUT_WAIT_GUIDE, 101usize as *const u8),
+                        (&XINPUT_CANCEL_GUIDE, 102usize as *const u8),
+                        (&XINPUT_POWER_OFF, 103usize as *const u8),
+                        (&XINPUT_CAPS_EX, 108usize as *const u8),
+                    ];
+                    unsafe { cache_required(module, &required, &optional) }
+                }
+            }
+            Vector::DInput8 => {
+                let module = unsafe { load_system32_module(DINPUT8_MODULE) };
+                if module.is_null() {
+                    false
+                } else {
+                    REAL_DINPUT8.store(module.cast(), Ordering::Release);
+                    let required = [(&DINPUT8_CREATE, c"DirectInput8Create".as_ptr().cast())];
+                    let optional = [
+                        (&DINPUT8_CAN_UNLOAD, c"DllCanUnloadNow".as_ptr().cast()),
+                        (&DINPUT8_GET_CLASS, c"DllGetClassObject".as_ptr().cast()),
+                        (&DINPUT8_REGISTER, c"DllRegisterServer".as_ptr().cast()),
+                        (&DINPUT8_UNREGISTER, c"DllUnregisterServer".as_ptr().cast()),
+                        (&DINPUT8_JOYSTICK_FORMAT, c"GetdfDIJoystick".as_ptr().cast()),
+                    ];
+                    unsafe { cache_required(module, &required, &optional) }
+                }
+            }
+            Vector::Injected | Vector::Unknown => false,
+        };
+        if !initialized {
+            return false;
+        }
+        FORWARDING_READY.store(true, Ordering::Release);
+        true
+    })
+}
 
 /// Declares a proxy export that forwards to the real system DLL, optionally
 /// denying the call while a lease is held.
@@ -196,8 +277,8 @@ const E_FAIL: i32 = -2_147_467_259;
 macro_rules! proxy_export {
     (
         $(#[$meta:meta])*
-        $gate:literal, $vis_name:ident, $slot:ident, $module_cache:ident, $module:ident,
-        $export:expr, ($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty, $fallback:expr
+        $gate:literal, $vis_name:ident, $slot:ident,
+        ($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty, $fallback:expr
     ) => {
         /// Cached address of the real export this thunk forwards to.
         static $slot: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
@@ -205,11 +286,16 @@ macro_rules! proxy_export {
         $(#[$meta])*
         #[unsafe(no_mangle)]
         #[allow(non_snake_case)]
-        pub unsafe extern "system" fn $vis_name($($arg: $ty),*) -> $ret {
+        pub(crate) unsafe extern "system" fn $vis_name($($arg: $ty),*) -> $ret {
+            let ready = forwarding_ready();
+            if !ready {
+                crate::startup_trace::record_bootstrap_fallback();
+                return $fallback;
+            }
             if $gate && blocking() {
                 return $fallback;
             }
-            let target = unsafe { real_export(&$slot, &$module_cache, $module, $export) };
+            let target = $slot.load(Ordering::Acquire);
             if target.is_null() {
                 return $fallback;
             }
@@ -222,39 +308,33 @@ macro_rules! proxy_export {
 
 proxy_export!(
     /// `XInputGetState` - gated; the injected build detours this same entry.
-    true, XInputGetState, XINPUT_GET_STATE, REAL_XINPUT, XINPUT_MODULE,
-    c"XInputGetState".as_ptr().cast(),
+    true, XInputGetState, XINPUT_GET_STATE,
     (user: u32, state: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
 );
 proxy_export!(
     /// `XInputGetCapabilities` - gated.
-    true, XInputGetCapabilities, XINPUT_GET_CAPABILITIES, REAL_XINPUT, XINPUT_MODULE,
-    c"XInputGetCapabilities".as_ptr().cast(),
+    true, XInputGetCapabilities, XINPUT_GET_CAPABILITIES,
     (user: u32, flags: u32, caps: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
 );
 proxy_export!(
     /// `XInputSetState` - pass-through. Rumble is not input, and blocking it
     /// would leave a game's force feedback dead while a WSGM panel is open.
-    false, XInputSetState, XINPUT_SET_STATE, REAL_XINPUT, XINPUT_MODULE,
-    c"XInputSetState".as_ptr().cast(),
+    false, XInputSetState, XINPUT_SET_STATE,
     (user: u32, vibration: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
 );
 proxy_export!(
     /// `XInputGetBatteryInformation` - pass-through.
-    false, XInputGetBatteryInformation, XINPUT_BATTERY, REAL_XINPUT, XINPUT_MODULE,
-    c"XInputGetBatteryInformation".as_ptr().cast(),
+    false, XInputGetBatteryInformation, XINPUT_BATTERY,
     (user: u32, device: u8, battery: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
 );
 proxy_export!(
     /// `XInputGetKeystroke` - pass-through.
-    false, XInputGetKeystroke, XINPUT_KEYSTROKE, REAL_XINPUT, XINPUT_MODULE,
-    c"XInputGetKeystroke".as_ptr().cast(),
+    false, XInputGetKeystroke, XINPUT_KEYSTROKE,
     (user: u32, reserved: u32, keystroke: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
 );
 proxy_export!(
     /// `XInputGetAudioDeviceIds` - pass-through.
-    false, XInputGetAudioDeviceIds, XINPUT_AUDIO, REAL_XINPUT, XINPUT_MODULE,
-    c"XInputGetAudioDeviceIds".as_ptr().cast(),
+    false, XInputGetAudioDeviceIds, XINPUT_AUDIO,
     (
         user: u32,
         render_id: *mut u16,
@@ -265,70 +345,12 @@ proxy_export!(
     ERROR_DEVICE_NOT_CONNECTED
 );
 
-/// Cached address of the real `XInputEnable`.
-static XINPUT_ENABLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-
-/// `XInputEnable` - pass-through. It returns nothing, so it cannot use
-/// `proxy_export!`, whose fallback is a return value.
-#[unsafe(no_mangle)]
-#[allow(non_snake_case)]
-pub unsafe extern "system" fn XInputEnable(enable: i32) {
-    let target = unsafe {
-        real_export(
-            &XINPUT_ENABLE,
-            &REAL_XINPUT,
-            XINPUT_MODULE,
-            c"XInputEnable".as_ptr().cast(),
-        )
-    };
-    if target.is_null() {
-        return;
-    }
-    let original: unsafe extern "system" fn(i32) = unsafe { core::mem::transmute(target) };
-    unsafe { original(enable) }
-}
-
-proxy_export!(
-    /// Ordinal 100, `XInputGetStateEx` - gated. This is the entry that reports
-    /// the Guide button, which the named `XInputGetState` masks off. The real
-    /// DLL exports it NONAME, so `build.rs` places this thunk at its ordinal.
-    true, wsgm_xinput_ordinal_100, XINPUT_STATE_EX, REAL_XINPUT, XINPUT_MODULE,
-    100usize as *const u8,
-    (user: u32, state: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
-);
-proxy_export!(
-    /// Ordinal 101, `XInputWaitForGuideButton` - pass-through.
-    false, wsgm_xinput_ordinal_101, XINPUT_WAIT_GUIDE, REAL_XINPUT, XINPUT_MODULE,
-    101usize as *const u8,
-    (user: u32, flags: u32, state: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
-);
-proxy_export!(
-    /// Ordinal 102, `XInputCancelGuideButtonWait` - pass-through.
-    false, wsgm_xinput_ordinal_102, XINPUT_CANCEL_GUIDE, REAL_XINPUT, XINPUT_MODULE,
-    102usize as *const u8,
-    (user: u32) -> u32, ERROR_DEVICE_NOT_CONNECTED
-);
-proxy_export!(
-    /// Ordinal 103, `XInputPowerOffController` - pass-through.
-    false, wsgm_xinput_ordinal_103, XINPUT_POWER_OFF, REAL_XINPUT, XINPUT_MODULE,
-    103usize as *const u8,
-    (user: u32) -> u32, ERROR_DEVICE_NOT_CONNECTED
-);
-proxy_export!(
-    /// Ordinal 108, `XInputGetCapabilitiesEx` - gated.
-    true, wsgm_xinput_ordinal_108, XINPUT_CAPS_EX, REAL_XINPUT, XINPUT_MODULE,
-    108usize as *const u8,
-    (reserved: u32, user: u32, flags: u32, caps: *mut c_void) -> u32,
-    ERROR_DEVICE_NOT_CONNECTED
-);
-
 proxy_export!(
     /// `DirectInput8Create` - pass-through. The DirectInput vector is a door
     /// into the process, not an interception point: Steam Input reads HID
     /// directly, and those hooks are installed process-wide regardless of which
     /// name the loader used to map this image.
-    false, DirectInput8Create, DINPUT8_CREATE, REAL_DINPUT8, DINPUT8_MODULE,
-    c"DirectInput8Create".as_ptr().cast(),
+    false, DirectInput8Create, DINPUT8_CREATE,
     (
         instance: *mut c_void,
         version: u32,
@@ -340,30 +362,74 @@ proxy_export!(
 );
 proxy_export!(
     /// `DllCanUnloadNow` - pass-through.
-    false, DllCanUnloadNow, DINPUT8_CAN_UNLOAD, REAL_DINPUT8, DINPUT8_MODULE,
-    c"DllCanUnloadNow".as_ptr().cast(), () -> i32, E_FAIL
+    false, DllCanUnloadNow, DINPUT8_CAN_UNLOAD, () -> i32, E_FAIL
 );
 proxy_export!(
     /// `DllGetClassObject` - pass-through.
-    false, DllGetClassObject, DINPUT8_GET_CLASS, REAL_DINPUT8, DINPUT8_MODULE,
-    c"DllGetClassObject".as_ptr().cast(),
+    false, DllGetClassObject, DINPUT8_GET_CLASS,
     (class_id: *const c_void, interface_id: *const c_void, out: *mut *mut c_void) -> i32,
     E_FAIL
 );
 proxy_export!(
     /// `DllRegisterServer` - pass-through.
-    false, DllRegisterServer, DINPUT8_REGISTER, REAL_DINPUT8, DINPUT8_MODULE,
-    c"DllRegisterServer".as_ptr().cast(), () -> i32, E_FAIL
+    false, DllRegisterServer, DINPUT8_REGISTER, () -> i32, E_FAIL
 );
 proxy_export!(
     /// `DllUnregisterServer` - pass-through.
-    false, DllUnregisterServer, DINPUT8_UNREGISTER, REAL_DINPUT8, DINPUT8_MODULE,
-    c"DllUnregisterServer".as_ptr().cast(), () -> i32, E_FAIL
+    false, DllUnregisterServer, DINPUT8_UNREGISTER, () -> i32, E_FAIL
 );
 proxy_export!(
     /// `GetdfDIJoystick` - pass-through.
-    false, GetdfDIJoystick, DINPUT8_JOYSTICK_FORMAT, REAL_DINPUT8, DINPUT8_MODULE,
-    c"GetdfDIJoystick".as_ptr().cast(), () -> *mut c_void, null_mut()
+    false, GetdfDIJoystick, DINPUT8_JOYSTICK_FORMAT, () -> *mut c_void, null_mut()
+);
+
+/// Cached address of the real `XInputEnable`.
+static XINPUT_ENABLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+/// `XInputEnable` - pass-through. It returns nothing, so it cannot use
+/// `proxy_export!`, whose fallback is a return value.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub(crate) unsafe extern "system" fn XInputEnable(enable: i32) {
+    if !forwarding_ready() {
+        crate::startup_trace::record_bootstrap_fallback();
+        return;
+    }
+    let target = XINPUT_ENABLE.load(Ordering::Acquire);
+    if target.is_null() {
+        return;
+    }
+    let original: unsafe extern "system" fn(i32) = unsafe { core::mem::transmute(target) };
+    unsafe { original(enable) }
+}
+
+proxy_export!(
+    /// Ordinal 100, `XInputGetStateEx` - gated. This is the entry that reports
+    /// the Guide button, which the named `XInputGetState` masks off. The real
+    /// DLL exports it NONAME, so `build.rs` places this thunk at its ordinal.
+    true, wsgm_xinput_ordinal_100, XINPUT_STATE_EX,
+    (user: u32, state: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
+);
+proxy_export!(
+    /// Ordinal 101, `XInputWaitForGuideButton` - pass-through.
+    false, wsgm_xinput_ordinal_101, XINPUT_WAIT_GUIDE,
+    (user: u32, flags: u32, state: *mut c_void) -> u32, ERROR_DEVICE_NOT_CONNECTED
+);
+proxy_export!(
+    /// Ordinal 102, `XInputCancelGuideButtonWait` - pass-through.
+    false, wsgm_xinput_ordinal_102, XINPUT_CANCEL_GUIDE,
+    (user: u32) -> u32, ERROR_DEVICE_NOT_CONNECTED
+);
+proxy_export!(
+    /// Ordinal 103, `XInputPowerOffController` - pass-through.
+    false, wsgm_xinput_ordinal_103, XINPUT_POWER_OFF,
+    (user: u32) -> u32, ERROR_DEVICE_NOT_CONNECTED
+);
+proxy_export!(
+    /// Ordinal 108, `XInputGetCapabilitiesEx` - gated.
+    true, wsgm_xinput_ordinal_108, XINPUT_CAPS_EX,
+    (reserved: u32, user: u32, flags: u32, caps: *mut c_void) -> u32,
+    ERROR_DEVICE_NOT_CONNECTED
 );
 
 /// Version of the proxy contract this build implements.
@@ -377,7 +443,7 @@ pub(crate) const PROXY_MARKER_VERSION: u32 = 1;
 /// or anything else that claimed the same name first.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub extern "system" fn WsgmSteamInputGateProxy() -> u32 {
+pub(crate) extern "system" fn WsgmSteamInputGateProxy() -> u32 {
     PROXY_MARKER_VERSION
 }
 
@@ -416,6 +482,11 @@ mod tests {
             assert!(!label.is_empty());
             assert!(!labels[..index].contains(label));
         }
+    }
+
+    #[test]
+    fn proxy_forwarding_starts_blocked_until_the_worker_publishes_a_complete_table() {
+        assert!(!forwarding_ready());
     }
 
     #[test]

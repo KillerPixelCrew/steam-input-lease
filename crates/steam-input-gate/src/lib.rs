@@ -8,7 +8,7 @@
 //! keeping an acquire connection open owns one lease, so EOF is a crash-safe
 //! release signal.
 //!
-//! The current implementation deliberately pins itself after startup because
+//! The current implementation deliberately pins itself during process attach because
 //! asynchronous hook and server code cannot safely execute from an unmapped
 //! image. Consequently, this version supports dynamic enable/disable but not
 //! dynamic DLL unloading. A future detach protocol must quiesce every worker
@@ -41,11 +41,17 @@ use steam_input_recovery::{
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_NO_SUCH_DEVICE, ERROR_SUCCESS, FALSE,
-    GetLastError, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, SetLastError,
-    TRUE,
+    CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_SUCH_DEVICE,
+    ERROR_SUCCESS, FALSE, GetLastError, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE,
+    LPARAM, LocalFree, SetLastError, TRUE,
 };
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY,
+    TokenOwner,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATEFILE2_EXTENDED_PARAMETERS, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN,
     GetFileType, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -65,7 +71,7 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateThread, GetCurrentProcess, GetCurrentProcessId, SetEvent,
+    CreateThread, GetCurrentProcess, GetCurrentProcessId, OpenProcessToken, SetEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetWindowThreadProcessId, PostMessageW, SMTO_NORMAL,
@@ -73,8 +79,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 mod proxy;
+mod startup_trace;
 
-use proxy::{classify_vector, record_self_module};
+use proxy::{Vector, classify_vector, initialize_forwarding, record_self_module};
+use startup_trace::StartupTrace;
 
 // Win32/NT constants that windows-sys does not expose through the selected API
 // surface. Values come from the Windows SDK headers used by the archived POC.
@@ -1720,7 +1728,7 @@ unsafe extern "system" fn notify_window(window: HWND, _: LPARAM) -> i32 {
 // making the client wait for it only adds latency. One permanent timer thread
 // serves every release; re-arming overwrites the deadline instead of stacking.
 //
-// Safety: the image is pinned in server_thread before any client thread can
+// Safety: the image is pinned in DllMain before any worker thread can
 // exist, so this detached thread can never execute unmapped code. This mutex is
 // touched only by pipe worker threads and the timer thread - NO detour may ever
 // take it.
@@ -2008,10 +2016,28 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
 /// knows which name it deployed and learns whether that name took from the pipe
 /// existing at all. This line is the human-facing half, readable in DebugView on
 /// a device where nothing else is attached.
-fn report_load_vector(module: HMODULE) {
-    let mut buffer = [0u16; 260];
-    let length =
-        unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+fn report_load_vector(module: HMODULE) -> Vector {
+    // The classification is load-bearing (an Unknown verdict skips forwarding
+    // initialization entirely and every export then stays on its disconnected
+    // fallback for the life of the process), so this must not truncate. MAX_PATH is
+    // not enough: a Steam library under a deep path fills the buffer, and a
+    // truncated tail loses the file name the verdict is derived from. Grow until
+    // the call stops reporting a full buffer.
+    let mut buffer = vec![0u16; 260];
+    let length = loop {
+        let length =
+            unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 {
+            break 0;
+        }
+        if length < buffer.len() {
+            break length;
+        }
+        if buffer.len() >= 32_768 {
+            break length;
+        }
+        buffer.resize(buffer.len() * 2, 0);
+    };
     let path = String::from_utf16_lossy(&buffer[..length.min(buffer.len())]);
     let file_name = path
         .rsplit(std::path::MAIN_SEPARATOR)
@@ -2021,6 +2047,19 @@ fn report_load_vector(module: HMODULE) {
     let message = format!("WSGM SteamInputGate loaded: vector={}\n", vector.label());
     let wide: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
     unsafe { OutputDebugStringW(wide.as_ptr()) };
+    vector
+}
+
+/// Reports whether the proxy released its startup block after caching every
+/// real-system target. DebugView is the only safe load-time diagnostic surface.
+fn report_forwarding_initialization(initialized: bool) {
+    let message = if initialized {
+        "WSGM SteamInputGate bootstrap block released\n"
+    } else {
+        "WSGM SteamInputGate bootstrap initialization failed; proxy remains blocked\n"
+    };
+    let wide: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    unsafe { OutputDebugStringW(wide.as_ptr()) };
 }
 
 /// Installs the detours the first time a lease is asked for.
@@ -2028,7 +2067,7 @@ fn report_load_vector(module: HMODULE) {
 /// Deliberately not done at load: as a search-order proxy this DLL is mapped
 /// during Steam's own startup, and having NtCreateFile/NtReadFile detoured
 /// through Steam's client-verification pass hung it on a cold boot straight
-/// after an install (device-observed 2026-08-19). Everything stays inert until
+/// after an install (device-observed 2026-08-19). The detours stay absent until
 /// WSGM asks for a block.
 ///
 /// Idempotent and serialized: several surfaces can acquire at once, and MinHook
@@ -2057,41 +2096,291 @@ fn ensure_hooks_installed() -> bool {
     installed
 }
 
-unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
-    let mut pinned: HMODULE = null_mut();
-    // Pinning prevents the Windows loader from unmapping code still referenced
-    // by hook trampolines or detached worker threads. See the module-level note.
-    unsafe {
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            server_thread as *const () as *const u16,
-            &mut pinned,
+// Security descriptor for the gate's control pipe.
+//
+// Every instance used to be created with a null SECURITY_ATTRIBUTES, i.e. with
+// the default named-pipe descriptor. Measured on the dev box (2026-08-23) that
+// is D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<token owner>)(A;;FR;;;WD)(A;;FR;;;AN):
+// the last two ACEs give Everyone and ANONYMOUS LOGON read access. A read-only
+// open still satisfies ConnectNamedPipe (it reports ERROR_PIPE_CONNECTED), and
+// the server then commits one pipe instance plus one worker thread that blocks
+// in a timeout-free ReadFile before a single request byte has been seen.
+// Instances are PIPE_UNLIMITED_INSTANCES, so any local principal could park
+// unbounded threads and kernel objects inside steam.exe without ever speaking
+// the protocol.
+//
+// The DACL below is the measured default MINUS those two read-only ACEs, so it
+// is a strict subset of what real clients already rely on: the host opens the
+// pipe with FILE_GENERIC_READ | FILE_GENERIC_WRITE, which no FR ACE ever
+// satisfied. FA (FILE_ALL_ACCESS) is granted rather than hand-picked FILE_*
+// bits because FILE_GENERIC_WRITE on a pipe includes FILE_CREATE_PIPE_INSTANCE,
+// and a narrower mask would fail the client's CreateFileW with ACCESS_DENIED.
+//
+// The descriptor is built with the SDDL helper from Win32_Security_Authorization
+// (that windows-sys feature is enabled in Cargo.toml for exactly this) rather
+// than by hand with InitializeSecurityDescriptor/AddAccessAllowedAce: one
+// auditable string, one allocation, one LocalFree.
+
+/// Longest string SID accepted from `ConvertSidToStringSidW`.
+///
+/// A real SID renders far shorter than this; the bound exists only so a missing
+/// terminator cannot turn the scan into an unbounded read.
+const SID_STRING_MAX_CHARS: usize = 512;
+
+/// Upper bound on the `TokenOwner` information buffer.
+///
+/// `GetTokenInformation` reports the size it wants; this caps how much of that
+/// report is trusted so a nonsense length cannot become a huge allocation.
+const TOKEN_OWNER_MAX_BYTES: u32 = 4096;
+
+/// Builds the SDDL text for the control pipe's DACL.
+///
+/// `owner_sid` must be the string form of the current token's OWNER, not its
+/// user. Two facts make that the correct mechanism:
+///
+/// * `CREATOR OWNER` (`CO`) is substituted only while an ACE is INHERITED. A
+///   DACL applied directly to an object keeps `CO` verbatim, where it matches
+///   nothing, so the owner has to be resolved explicitly through
+///   `GetTokenInformation(TokenOwner)`.
+/// * Reproducing the OWNER reproduces exactly what the default descriptor
+///   granted, whatever that resolves to on the machine. Substituting the token
+///   USER would not: where the two differ (an elevated process whose owner is
+///   `BUILTIN\Administrators` - the behaviour `WSGM.Launch\AGENTS.md` records
+///   from a real device failure on 2026-08-12, where .NET's `CurrentUserOnly`
+///   granted the owner and the medium child was denied) the USID form would
+///   WIDEN access rather than narrow it.
+///
+/// Functionality does not depend on which of the two the owner resolves to: an
+/// elevated client matches the `BA` ACE, and an unelevated client against an
+/// unelevated Steam matches the owner ACE, which is the user in that case.
+///
+/// NOT CLAIMED: that this keeps a medium-integrity client away from an elevated
+/// Steam's gate. Whether owner and user differ depends on the machine's
+/// "default owner for objects created by members of the Administrators group"
+/// policy, which is not verified here and is not relied upon - the default
+/// descriptor carried the same owner ACE, so this is a strict subset of today
+/// either way, and no security property is newly asserted.
+///
+/// No mandatory label (`S:`) is added either: the default descriptor carried
+/// none, and adding one would newly deny callers that reach the gate today.
+fn control_pipe_sddl(owner_sid: &str) -> String {
+    format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{owner_sid})")
+}
+
+/// Reads the current process token's owner SID in string (`S-1-...`) form.
+///
+/// Returns `None` when the token cannot be opened or read, or when the SID
+/// cannot be rendered. The caller then keeps the default descriptor rather than
+/// refusing to listen.
+///
+/// # Safety
+/// Every raw pointer passed to Win32 here is a live local or a buffer this
+/// function owns for the whole call, and the token handle is closed on both
+/// paths. Nothing here can panic, so nothing can unwind out of the gate worker.
+fn current_token_owner_sid() -> Option<String> {
+    let mut token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == FALSE {
+        return None;
+    }
+    let owner = read_token_owner_sid(token);
+    unsafe { CloseHandle(token) };
+    owner
+}
+
+/// Renders the `TokenOwner` SID of an already-open token.
+///
+/// # Safety
+/// `token` must be a token handle opened with `TOKEN_QUERY`; it is only read.
+/// The `TOKEN_OWNER` header is copied out with `read_unaligned` because it lives
+/// in a `Vec<u8>`, whose allocation guarantees only byte alignment: forming a
+/// `&TOKEN_OWNER` over that buffer would be undefined behaviour even though the
+/// pointer is suitably aligned in practice, and clippy does not catch it
+/// (`cast_ptr_alignment` is pedantic-only). The copied `Owner` pointer borrows
+/// `buffer`, so it is consumed before `buffer` is dropped.
+fn read_token_owner_sid(token: HANDLE) -> Option<String> {
+    let mut needed = 0u32;
+    // The probing call is expected to fail with ERROR_INSUFFICIENT_BUFFER; the
+    // length it reports is the only thing wanted from it.
+    let probed = unsafe { GetTokenInformation(token, TokenOwner, null_mut(), 0, &mut needed) };
+    if probed == FALSE && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+        // Documented behaviour is failure with a required length. Anything else
+        // is unexpected enough that guessing at the buffer would be wrong.
+        return None;
+    }
+    if needed < size_of::<TOKEN_OWNER>() as u32 || needed > TOKEN_OWNER_MAX_BYTES {
+        return None;
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    let mut written = needed;
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenOwner,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &mut written,
         )
     };
-    // The self-identity guard must know our handle BEFORE any hook is installed:
-    // `install_xinput_module` refuses to detour a module that is us, and it fails
-    // closed while the handle is still unknown, so recording it here is what lets
-    // the real System32 XInput module be hooked at all.
-    record_self_module(pinned);
-    report_load_vector(pinned);
+    if read == FALSE || written < size_of::<TOKEN_OWNER>() as u32 {
+        return None;
+    }
+    let owner = unsafe { core::ptr::read_unaligned::<TOKEN_OWNER>(buffer.as_ptr().cast()) };
+    if owner.Owner.is_null() {
+        return None;
+    }
+    let sid = sid_to_string(owner.Owner);
+    drop(buffer);
+    sid
+}
+
+/// Converts a SID into its string form, freeing the Win32 allocation.
+///
+/// # Safety
+/// `sid` must point at a valid SID that stays alive for the call. The string
+/// buffer belongs to Win32 and is released with `LocalFree` before returning.
+fn sid_to_string(sid: PSID) -> Option<String> {
+    let mut text: *mut u16 = null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == FALSE || text.is_null() {
+        return None;
+    }
+    let mut length = 0usize;
+    while length < SID_STRING_MAX_CHARS && unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+    unsafe { LocalFree(text.cast::<c_void>()) };
+    if length == 0 || length == SID_STRING_MAX_CHARS {
+        // No terminator inside the bound means this was not the short string SID
+        // expected here, and a truncated SID would build a silently wrong DACL.
+        return None;
+    }
+    Some(value)
+}
+
+/// Owns a security descriptor allocated by
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+///
+/// Win32 requires the caller to free it with `LocalFree`, and the gate worker
+/// has an early-return path on permanent pipe failure, so ownership is expressed
+/// as a guard rather than a hand-placed call a later edit could miss.
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl LocalSecurityDescriptor {
+    /// Borrows the raw descriptor for a `SECURITY_ATTRIBUTES` field.
+    fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+}
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // Safety: the pointer came from the SDDL converter and is freed
+            // exactly once, when this guard leaves the worker's scope.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+/// Parses `sddl` into a heap security descriptor, or `None` if Windows rejects it.
+///
+/// # Safety
+/// The UTF-16 buffer outlives the call, and the descriptor Win32 allocates is
+/// handed straight to the guard that frees it.
+fn build_security_descriptor(sddl: &str) -> Option<LocalSecurityDescriptor> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } != FALSE;
+    if !converted || descriptor.is_null() {
+        return None;
+    }
+    Some(LocalSecurityDescriptor(descriptor))
+}
+
+/// Builds the control pipe's descriptor and reports the owner SID it scoped to.
+///
+/// `None` means the gate FAILS OPEN to the default descriptor. That is today's
+/// exact behaviour and must stay: a gate that refused to listen would break
+/// controller blocking outright on a machine where the SDDL work fails, which is
+/// strictly worse than the resource exposure this removes.
+fn build_control_pipe_descriptor() -> Option<(LocalSecurityDescriptor, String)> {
+    let owner = current_token_owner_sid()?;
+    let descriptor = build_security_descriptor(&control_pipe_sddl(&owner))?;
+    Some((descriptor, owner))
+}
+
+unsafe extern "system" fn server_thread(parameter: *mut c_void) -> u32 {
+    let mut startup_trace = StartupTrace::open();
+    let pinned = parameter as HMODULE;
+    let vector = report_load_vector(pinned);
+    startup_trace.log(format_args!("worker entered; vector={}", vector.label()));
+    if matches!(vector, Vector::XInput14 | Vector::DInput8) {
+        // ValvePlug's proxy starts blocked. Preserve that safe property while
+        // retaining WSGM's dynamic leases: Steam's startup exports return their
+        // disconnected fallback until this worker has loaded the real System32
+        // module and cached every target. The release store occurs inside
+        // initialize_forwarding only after the table is complete.
+        startup_trace.log("forwarding initialization started");
+        let initialized = initialize_forwarding(vector);
+        report_forwarding_initialization(initialized);
+        startup_trace.log(format_args!(
+            "forwarding initialization finished; ready={initialized}; bootstrap-fallback-calls={}",
+            startup_trace::bootstrap_fallback_calls()
+        ));
+        startup_trace.log_export_resolution();
+        if initialized {
+            // Calls made during the short bootstrap block saw a disconnected
+            // device. This non-blocking notification lets any Steam window that
+            // already exists schedule its ordinary device rediscovery; SDL's
+            // normal polling covers the earlier-no-window case.
+            startup_trace.log("startup device rediscovery started");
+            unsafe { EnumWindows(Some(notify_window), 0) };
+            startup_trace.log("startup device rediscovery finished");
+        }
+    } else {
+        startup_trace.log("forwarding initialization skipped for non-proxy vector");
+    }
     // Hooks are NOT installed here. As a proxy this DLL loads during Steam's own
     // startup, and detouring NtCreateFile/NtReadFile that early puts our code in
     // front of Steam's client-verification pass - a cold boot right after an
     // install hung Steam there (device-observed 2026-08-19). Injection never had
     // this exposure because it happened with Steam already up. Installing on the
-    // first lease keeps the payload completely inert until WSGM actually asks for
-    // a block, which also makes the pass-through guarantee trivially true: there
-    // is no detour to pass through.
+    // first lease keeps the process-wide hooks inert until WSGM actually asks for
+    // a block, which also makes their pass-through guarantee trivially true:
+    // there is no detour to pass through.
 
-    // Warm RECOVERY_LAYOUT and HID_THREAD_ADDRESS so the first acquire's
-    // response() costs a few reads instead of a full address-space sweep. It runs
-    // on its own thread because the control pipe must not wait for it: the sweep
-    // can take seconds, and a host querying status uses a short fixed timeout and
-    // never injects, so serialising the two would make a loaded payload look
-    // absent. Placed after install_hooks so the trampolines are live.
-
+    // Scope the control pipe ONCE, before the accept loop. Building it inside
+    // would charge a failing construction against PIPE_CREATE_MAX_FAILURES and
+    // could retire the server for the life of this steam.exe - the image is
+    // pinned, so DllMain never runs again and the pipe could not be revived.
+    let scoped = build_control_pipe_descriptor();
+    let attributes = scoped.as_ref().map(|(descriptor, _)| SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.as_ptr(),
+        bInheritHandle: FALSE,
+    });
+    let security = attributes
+        .as_ref()
+        .map_or(null::<SECURITY_ATTRIBUTES>(), |value| {
+            value as *const SECURITY_ATTRIBUTES
+        });
+    startup_trace.log(format_args!(
+        "control pipe descriptor scoped={}; owner={}",
+        attributes.is_some(),
+        scoped
+            .as_ref()
+            .map_or("<unavailable>", |(_, owner)| owner.as_str())
+    ));
     let pipe_name = steam_input_lease_core::pipe_name(unsafe { GetCurrentProcessId() });
     let mut pipe_failures = 0u32;
+    let mut pipe_listening_logged = false;
     loop {
         let pipe = unsafe {
             CreateNamedPipeW(
@@ -2102,7 +2391,7 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
                 size_of::<Response>() as u32,
                 size_of::<Request>() as u32,
                 0,
-                null(),
+                security,
             )
         };
         if pipe == INVALID_HANDLE_VALUE {
@@ -2112,13 +2401,27 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
             // transient causes (resource pressure, or the name momentarily held
             // by another process) and give up only on a persistent failure.
             pipe_failures += 1;
+            if pipe_failures == 1 {
+                startup_trace.log(format_args!(
+                    "control pipe creation failed; win32-error={}",
+                    unsafe { GetLastError() }
+                ));
+            }
             if pipe_failures >= PIPE_CREATE_MAX_FAILURES {
+                startup_trace.log("control pipe creation failed permanently; worker exiting");
                 return 2;
             }
             thread::sleep(PIPE_CREATE_RETRY_DELAY);
             continue;
         }
         pipe_failures = 0;
+        if !pipe_listening_logged {
+            pipe_listening_logged = true;
+            startup_trace.log(format_args!(
+                "control pipe listening; bootstrap-fallback-calls={}",
+                startup_trace::bootstrap_fallback_calls()
+            ));
+        }
         let connected = unsafe { ConnectNamedPipe(pipe, null_mut()) } != FALSE
             || unsafe { GetLastError() } == 535; // ERROR_PIPE_CONNECTED
         if !connected {
@@ -2142,14 +2445,19 @@ unsafe extern "system" fn server_thread(_: *mut c_void) -> u32 {
 ///
 /// # Safety
 /// Called only by the Windows loader with its documented `DllMain` arguments.
-pub unsafe extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _: *mut c_void) -> i32 {
+pub(crate) unsafe extern "system" fn DllMain(
+    instance: HINSTANCE,
+    reason: u32,
+    _: *mut c_void,
+) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
+        startup_trace::mark_attach_entered();
         // Record our own handle FIRST, from the one the loader just handed us.
         //
         // This one store is what stopped Steam hanging on EVERY cold boot with the
         // proxy deployed (device-verified 2026-08-20: 100% before, 0 in 10 boots
-        // after). The server thread also records it, but it cannot run until the
-        // loader lock is released, and until the handle is known `proxy::is_self`
+        // after). The server thread cannot run until the loader lock is released,
+        // and until the handle is known `proxy::is_self`
         // fails CLOSED - so during that window `load_system32_module` performed a
         // full `LoadLibraryExW` of the real System32 XInput, rejected the result as
         // possibly-us, and returned null WITHOUT caching anything. Every XInput call
@@ -2164,14 +2472,137 @@ pub unsafe extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _: *mut 
         // the server thread, and never make the identity guard the only thing that
         // decides whether the real module gets cached.
         record_self_module(instance as HMODULE);
-        // Keep loader-lock work minimal. All allocation, hook installation, and
-        // pipe setup occurs asynchronously on server_thread.
+        startup_trace::mark_self_recorded();
+        // SDL may unload XInput immediately after resolving its exports. Pin on
+        // the loader thread, before creating our worker, so the worker's entry
+        // point can never be unmapped before it gets scheduled. ValvePlug uses
+        // this same process-attach ownership rule.
+        let mut pinned: HMODULE = null_mut();
+        let pinned_ok = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                DllMain as *const () as *const u16,
+                &mut pinned,
+            )
+        } != FALSE;
+        startup_trace::mark_pin_result(pinned_ok && !pinned.is_null());
+        // NEVER return FALSE from process-attach. This image IS Steam's
+        // XInput1_4.dll/dinput8.dll, so a FALSE here makes the loader unmap us and
+        // Steam's own LoadLibraryW("XInput1_4.dll") return NULL - a far harder
+        // failure than the unmap-race the pin guards against. Without the pin we
+        // simply do not start the worker: every export then stays on its
+        // forwarding_ready() == false fallback, which is the same net input
+        // behaviour, and the trace records why.
+        if !pinned_ok || pinned.is_null() {
+            return TRUE;
+        }
+        record_self_module(pinned);
+        // Keep the remaining loader-lock work minimal. All allocation, module
+        // resolution, hook installation, and pipe setup occurs asynchronously.
         unsafe { DisableThreadLibraryCalls(instance) };
+        startup_trace::mark_worker_requested();
         let worker =
-            unsafe { CreateThread(null(), 0, Some(server_thread), null_mut(), 0, null_mut()) };
+            unsafe { CreateThread(null(), 0, Some(server_thread), pinned.cast(), 0, null_mut()) };
         if !worker.is_null() {
             unsafe { CloseHandle(worker) };
+        } else {
+            startup_trace::mark_worker_create_failed();
         }
     }
     TRUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+    const SAMPLE_OWNER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    #[test]
+    fn control_pipe_sddl_grants_system_administrators_and_the_token_owner() {
+        assert_eq!(
+            control_pipe_sddl(SAMPLE_OWNER),
+            "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-21-1111111111-2222222222-3333333333-1001)"
+        );
+    }
+
+    #[test]
+    fn control_pipe_sddl_drops_the_default_everyone_and_anonymous_read_aces() {
+        let sddl = control_pipe_sddl(SAMPLE_OWNER);
+        assert!(!sddl.contains(";WD)"), "Everyone survived the scoped DACL: {sddl}");
+        assert!(!sddl.contains(";AN)"), "ANONYMOUS survived the scoped DACL: {sddl}");
+    }
+
+    #[test]
+    fn control_pipe_sddl_parses_as_a_windows_security_descriptor() {
+        // A malformed string would make build_security_descriptor return None,
+        // the worker would fall back to the default descriptor, and the whole
+        // change would be a silent no-op.
+        let descriptor = build_security_descriptor(&control_pipe_sddl(SAMPLE_OWNER));
+        assert!(descriptor.is_some());
+    }
+
+    #[test]
+    fn the_built_descriptor_carries_only_the_three_intended_aces() {
+        // Rendering the descriptor Windows actually built - rather than the
+        // string that was handed to it - is what proves the kernel-visible DACL
+        // really lost the Everyone and ANONYMOUS read ACEs.
+        let descriptor =
+            build_security_descriptor(&control_pipe_sddl(SAMPLE_OWNER)).expect("valid SDDL");
+        let mut text: *mut u16 = null_mut();
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.as_ptr(),
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                null_mut(),
+            )
+        } != FALSE;
+        assert!(converted && !text.is_null());
+        let mut length = 0usize;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let rendered = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        unsafe { LocalFree(text.cast::<c_void>()) };
+        assert!(rendered.contains(";SY)"), "SYSTEM ACE missing: {rendered}");
+        assert!(rendered.contains(";BA)"), "Administrators ACE missing: {rendered}");
+        assert!(
+            rendered.contains(SAMPLE_OWNER),
+            "owner ACE missing: {rendered}"
+        );
+        assert!(!rendered.contains(";WD)"), "Everyone survived: {rendered}");
+        assert!(!rendered.contains(";AN)"), "ANONYMOUS survived: {rendered}");
+        // "only" is the property that matters: the change is the measured default
+        // MINUS two ACEs, so a fourth principal appearing (INTERACTIVE,
+        // AUTHENTICATED USERS, ...) must fail even though every assertion above
+        // still passes.
+        assert_eq!(
+            rendered.matches("(A;").count(),
+            3,
+            "expected exactly three allow ACEs: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("(D;").count(),
+            0,
+            "unexpected deny ACE: {rendered}"
+        );
+    }
+
+    #[test]
+    fn build_control_pipe_descriptor_scopes_the_pipe_for_this_token() {
+        let scoped = build_control_pipe_descriptor();
+        let (_descriptor, owner) = scoped.expect("this token must yield a usable descriptor");
+        assert!(owner.starts_with("S-1-"), "unexpected owner SID: {owner}");
+    }
+
+    #[test]
+    fn current_token_owner_sid_returns_a_string_sid() {
+        let owner = current_token_owner_sid().expect("the current token must expose an owner");
+        assert!(owner.starts_with("S-1-"), "unexpected owner SID: {owner}");
+    }
 }

@@ -62,9 +62,18 @@ is deployed under a name Steam resolves through the default DLL search order
 (`XInput1_4.dll`, falling back to `dinput8.dll`), so **Steam loads it itself and
 nothing writes into the Steam process**. The vector is only a door: every export
 forwards to the real module in System32, and once the image is mapped the same
-process-wide hooks run as before. A deployed proxy is inert until a lease is
-taken, so a machine where the file is present but nothing holds a lease behaves
-exactly like one where it is absent.
+process-wide hooks run as before. The proxy begins with its forwarding exports
+blocked, resolves and caches the real System32 table once on its pinned worker,
+then releases that bootstrap block and asks Steam to rediscover controllers.
+The process-wide HID/XInput hooks remain uninstalled until a lease is taken, so
+after bootstrap a machine where no lease is held behaves like one where the
+proxy is absent.
+
+For boot-only startup diagnosis, every mapped payload writes worker-side phases
+to `%LOCALAPPDATA%\WSGM\steam-input-gate-<steam-pid>.log`. `DllMain` and proxy
+exports only update atomics; they never write the file or take a trace lock. The
+per-pid name keeps a failed boot trace intact when Steam is subsequently started
+by hand, and WSGM records the expected path in its ordinary log.
 
 Injection remains implemented and is reachable only by opting in through
 `allow_injection` (C ABI version 4). It exists for the per-game launch wrapper on
@@ -84,7 +93,7 @@ across the supported system XInput DLLs.
 ```mermaid
 flowchart LR
     Steam[Steam client<br/>steam.exe]
-    Gate[steam_input_gate.dll<br/>injected payload]
+    Gate[steam_input_gate.dll<br/>resident payload]
     Pipe[Named pipe<br/>SteamInputGate-PID]
     Host[steam-input-lease<br/>host library]
     CLI[CLI wrapper]

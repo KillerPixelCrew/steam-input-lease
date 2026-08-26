@@ -206,7 +206,7 @@ fn prune_old_traces(directory: &std::path::Path, keep: usize) {
     if traces.len() <= keep {
         return;
     }
-    traces.sort_by(|a, b| b.0.cmp(&a.0));
+    traces.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, path) in traces.into_iter().skip(keep) {
         let _ = std::fs::remove_file(path);
     }

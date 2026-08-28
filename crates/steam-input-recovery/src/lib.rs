@@ -16,6 +16,14 @@
 //! appropriate Win32 APIs and ownership rules are known.
 
 #![deny(missing_docs)]
+// clippy 1.98 added `chunks_exact_to_as_chunks`, which fires on the three 8-byte
+// scan loops below. The suggested `as_chunks::<8>()` splits the slice into an
+// array prefix plus a remainder, so adopting it would reshape loops whose index
+// arithmetic is tied to a byte offset in a snapshot of Steam's private memory —
+// a live-verified path (docs\steam-input.md) with nothing to gain from the
+// rewrite. Suppressed rather than "cleaned up": see the root AGENTS.md rule
+// against refactoring verified mechanisms without re-verification.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 use core::fmt;
 

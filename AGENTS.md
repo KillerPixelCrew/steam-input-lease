@@ -3,7 +3,9 @@
 This Rust workspace delivers the Steam Input gate as a proxy DLL and provides the pipe-backed
 lease, the C ABI, the .NET binding, and a diagnostic CLI.
 
-**This is a standalone, publicly consumable library (MIT).** It was extracted from WSGM, which is
+**This is a standalone, publicly consumable library.** Its licence is MIT **with an added
+OEM-preinstallation restriction** (`LICENSE-MIT`) — not plain MIT, so do not describe it as such
+or declare the `MIT` SPDX identifier for it in package metadata. It was extracted from WSGM, which is
 still its primary consumer, but it is no longer WSGM-internal — treat the C ABI and the .NET
 binding as public surface with outside users.
 

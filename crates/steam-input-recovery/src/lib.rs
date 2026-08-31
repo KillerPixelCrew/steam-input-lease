@@ -23,6 +23,10 @@
 // a live-verified path (docs\steam-input.md) with nothing to gain from the
 // rewrite. Suppressed rather than "cleaned up": see the root AGENTS.md rule
 // against refactoring verified mechanisms without re-verification.
+// `unknown_lints` keeps the same source buildable on the current 1.94 toolchain,
+// where the newer lint name does not exist yet; it can be removed once the
+// repository's minimum Rust toolchain includes that lint.
+#![allow(unknown_lints)]
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use core::fmt;

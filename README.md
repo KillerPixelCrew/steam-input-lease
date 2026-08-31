@@ -158,7 +158,7 @@ itself, and `release()` blocks for roughly 4.5 s.
 
 ```toml
 [dependencies]
-steam-input-lease = { path = "../SteamInput/crates/steam-input-lease" }
+steam-input-lease = { git = "https://github.com/KillerPixelCrew/steam-input-lease" }
 ```
 
 The default client targets the current-session `steam.exe` and expects

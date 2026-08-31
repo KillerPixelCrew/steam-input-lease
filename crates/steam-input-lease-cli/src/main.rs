@@ -26,9 +26,8 @@ fn usage() {
 }
 
 fn run() -> Result<u32, String> {
-    // The diagnostic tool keeps the injection path reachable: it is how the
-    // injected delivery route stays testable now that every shipped caller
-    // defaults to a payload Steam loaded itself.
+    // Diagnostics deliberately exercises injection; shipped callers normally use a payload that
+    // Steam loaded itself.
     let mut options = ClientOptions {
         allow_injection: true,
         ..ClientOptions::default()

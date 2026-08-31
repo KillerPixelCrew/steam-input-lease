@@ -45,7 +45,7 @@ internal static class NativeMethods
     internal const int RecoveryMessageCapacity = 256;
 
     // Blittable by design: the inline UTF-8 message is a fixed byte array, so
-    // this struct needs no marshaller and stays usable from NativeAOT.
+    // this struct needs no custom marshaller at the native boundary.
     [StructLayout(LayoutKind.Sequential)]
     internal unsafe struct ReleaseOutcome
     {

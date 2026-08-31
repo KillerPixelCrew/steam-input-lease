@@ -1,3 +1,6 @@
+using System;
+using System.IO;
+
 namespace SteamInterop;
 
 /// <summary>Configuration for locating a target process and its Rust payload.</summary>

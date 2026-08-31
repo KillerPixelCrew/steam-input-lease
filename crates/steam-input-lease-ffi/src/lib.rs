@@ -240,11 +240,11 @@ unsafe fn client_ref<'a>(client: *mut SilClient) -> Result<&'a Client, String> {
 }
 
 #[unsafe(no_mangle)]
-/// Returns the version of the exported C ABI, currently `3`.
+/// Returns the version of the exported C ABI, currently `4`.
 ///
 /// Version `2` changed `sil_lease_release` to report a [`SilReleaseOutcome`]
 /// instead of a bare [`SilStatus`]. Version `3` added the `release` output to
-/// `sil_client_run_wrapped`, which previously discarded the final handshake.
+/// `sil_client_run_wrapped`. Version `4` added the client injection option.
 pub extern "C" fn sil_abi_version() -> u32 {
     4
 }

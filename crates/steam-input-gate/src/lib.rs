@@ -2096,30 +2096,9 @@ fn ensure_hooks_installed() -> bool {
     installed
 }
 
-// Security descriptor for the gate's control pipe.
-//
-// Every instance used to be created with a null SECURITY_ATTRIBUTES, i.e. with
-// the default named-pipe descriptor. Measured on the dev box (2026-08-23) that
-// is D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<token owner>)(A;;FR;;;WD)(A;;FR;;;AN):
-// the last two ACEs give Everyone and ANONYMOUS LOGON read access. A read-only
-// open still satisfies ConnectNamedPipe (it reports ERROR_PIPE_CONNECTED), and
-// the server then commits one pipe instance plus one worker thread that blocks
-// in a timeout-free ReadFile before a single request byte has been seen.
-// Instances are PIPE_UNLIMITED_INSTANCES, so any local principal could park
-// unbounded threads and kernel objects inside steam.exe without ever speaking
-// the protocol.
-//
-// The DACL below is the measured default MINUS those two read-only ACEs, so it
-// is a strict subset of what real clients already rely on: the host opens the
-// pipe with FILE_GENERIC_READ | FILE_GENERIC_WRITE, which no FR ACE ever
-// satisfied. FA (FILE_ALL_ACCESS) is granted rather than hand-picked FILE_*
-// bits because FILE_GENERIC_WRITE on a pipe includes FILE_CREATE_PIPE_INSTANCE,
-// and a narrower mask would fail the client's CreateFileW with ACCESS_DENIED.
-//
-// The descriptor is built with the SDDL helper from Win32_Security_Authorization
-// (that windows-sys feature is enabled in Cargo.toml for exactly this) rather
-// than by hand with InitializeSecurityDescriptor/AddAccessAllowedAce: one
-// auditable string, one allocation, one LocalFree.
+// The gate's duplex client requires full pipe access. Restricting the descriptor
+// to System, administrators and the token owner also prevents read-only opens
+// from consuming an accept-loop instance and worker.
 
 /// Longest string SID accepted from `ConvertSidToStringSidW`.
 ///
@@ -2135,34 +2114,10 @@ const TOKEN_OWNER_MAX_BYTES: u32 = 4096;
 
 /// Builds the SDDL text for the control pipe's DACL.
 ///
-/// `owner_sid` must be the string form of the current token's OWNER, not its
-/// user. Two facts make that the correct mechanism:
-///
-/// * `CREATOR OWNER` (`CO`) is substituted only while an ACE is INHERITED. A
-///   DACL applied directly to an object keeps `CO` verbatim, where it matches
-///   nothing, so the owner has to be resolved explicitly through
-///   `GetTokenInformation(TokenOwner)`.
-/// * Reproducing the OWNER reproduces exactly what the default descriptor
-///   granted, whatever that resolves to on the machine. Substituting the token
-///   USER would not: where the two differ (an elevated process whose owner is
-///   `BUILTIN\Administrators` - the behaviour `WSGM.Launch\AGENTS.md` records
-///   from a real device failure on 2026-08-12, where .NET's `CurrentUserOnly`
-///   granted the owner and the medium child was denied) the USID form would
-///   WIDEN access rather than narrow it.
-///
-/// Functionality does not depend on which of the two the owner resolves to: an
-/// elevated client matches the `BA` ACE, and an unelevated client against an
-/// unelevated Steam matches the owner ACE, which is the user in that case.
-///
-/// NOT CLAIMED: that this keeps a medium-integrity client away from an elevated
-/// Steam's gate. Whether owner and user differ depends on the machine's
-/// "default owner for objects created by members of the Administrators group"
-/// policy, which is not verified here and is not relied upon - the default
-/// descriptor carried the same owner ACE, so this is a strict subset of today
-/// either way, and no security property is newly asserted.
-///
-/// No mandatory label (`S:`) is added either: the default descriptor carried
-/// none, and adding one would newly deny callers that reach the gate today.
+/// `owner_sid` is the current token owner, not its user. `CREATOR OWNER` is
+/// expanded only for inherited ACEs, so a directly applied descriptor must name
+/// the resolved owner explicitly. System and administrators retain their normal
+/// access, and no mandatory label changes which integrity levels can connect.
 fn control_pipe_sddl(owner_sid: &str) -> String {
     format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{owner_sid})")
 }

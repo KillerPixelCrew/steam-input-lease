@@ -15,10 +15,21 @@ public sealed class SteamInputClient : IDisposable
     /// <summary>Creates a client with optional process and payload overrides.</summary>
     /// <param name="options">Options to use, or <see langword="null"/> for defaults.</param>
     /// <exception cref="SteamInputLeaseException">Native client creation failed.</exception>
+    /// <exception cref="NotSupportedException">The loaded native DLL has an incompatible ABI.</exception>
+    /// <exception cref="ArgumentException">An option contains an embedded NUL character.</exception>
     /// <exception cref="OverflowException">The timeout cannot be represented in milliseconds.</exception>
     public SteamInputClient(SteamInputClientOptions? options = null)
     {
+        NativeMethods.EnsureCompatibleAbi();
         options ??= new SteamInputClientOptions();
+        if (options.TargetName.Contains('\0'))
+        {
+            throw new ArgumentException("The target name cannot contain a NUL character.", nameof(options));
+        }
+        if (options.PayloadPath.Contains('\0'))
+        {
+            throw new ArgumentException("The payload path cannot contain a NUL character.", nameof(options));
+        }
         nint targetName = Marshal.StringToCoTaskMemUni(options.TargetName);
         nint payloadPath = Marshal.StringToCoTaskMemUni(options.PayloadPath);
         try
@@ -107,6 +118,18 @@ public sealed class SteamInputClient : IDisposable
         if (arguments.Length == 0)
         {
             throw new ArgumentException("At least one command argument is required.", nameof(arguments));
+        }
+        for (int index = 0; index < arguments.Length; index++)
+        {
+            if (arguments[index] is null)
+            {
+                throw new ArgumentException($"Command argument {index} is null.", nameof(arguments));
+            }
+            if (arguments[index].Contains('\0'))
+            {
+                throw new ArgumentException(
+                    $"Command argument {index} contains a NUL character.", nameof(arguments));
+            }
         }
 
         nint pointerArray = Marshal.AllocCoTaskMem(arguments.Length * IntPtr.Size);

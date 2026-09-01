@@ -1,4 +1,6 @@
+using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace SteamInterop;
@@ -9,6 +11,8 @@ internal static class NativeMethods
     // fixed-width sequential structs. No Rust or managed object layout crosses
     // this boundary.
     private const string Library = "steam_input_lease_ffi";
+    internal const uint ExpectedAbiVersion = 4;
+    private static int _abiValidated;
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct ClientOptions
@@ -107,6 +111,26 @@ internal static class NativeMethods
         string message = Marshal.PtrToStringUTF8(sil_last_error_message())
             ?? "The native Steam Input Lease operation failed.";
         throw new SteamInputLeaseException(message, result);
+    }
+
+    internal static void EnsureCompatibleAbi()
+    {
+        if (Volatile.Read(ref _abiValidated) != 0)
+        {
+            return;
+        }
+
+        // This MUST be the first native operation made by a managed client. A
+        // different ABI may use different struct sizes, so even asking it for
+        // an error string or creating a client would already be unsafe.
+        uint actual = sil_abi_version();
+        if (actual != ExpectedAbiVersion)
+        {
+            throw new NotSupportedException(
+                $"Steam Input Lease ABI {actual} is incompatible; this binding requires ABI {ExpectedAbiVersion}.");
+        }
+
+        Volatile.Write(ref _abiValidated, 1);
     }
 }
 

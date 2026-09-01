@@ -41,9 +41,10 @@ use steam_input_recovery::{
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_SUCH_DEVICE,
-    ERROR_SUCCESS, FALSE, GetLastError, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE,
-    LPARAM, LocalFree, SetLastError, TRUE,
+    CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+    ERROR_DEVICE_NOT_CONNECTED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_SUCH_DEVICE, ERROR_SUCCESS,
+    FALSE, GetLastError, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LocalFree,
+    SetLastError, TRUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -124,7 +125,7 @@ const SDL_DEVICE_CHANGE_TIMEOUT_MS: u32 = 2_000;
 
 const MODULE_SNAPSHOT_LIMIT: usize = 512 * 1024 * 1024;
 const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
-const HANDLE_QUERY_LIMIT: usize = 1024 * 1024 * 1024;
+const HANDLE_QUERY_LIMIT: usize = 256 * 1024 * 1024;
 
 // Minimal NT structure layouts required by the native Nt* hooks and system
 // handle enumeration. Their field order and pointer-sized members must remain
@@ -370,6 +371,11 @@ const TOMBSTONE: usize = 1;
 const HANDLE_PROBE_LIMIT: usize = 16;
 static HANDLE_TABLE: RwLock<[HandleSlot; HANDLE_TABLE_SIZE]> =
     RwLock::new([EMPTY_HANDLE_SLOT; HANDLE_TABLE_SIZE]);
+
+// Serializes the close hook against the enumerate/pin/verify/revoke sequence.
+// CompareObjectHandles protects against an already recycled numeric value; this
+// barrier closes the remaining compare-to-NtClose window for ordinary closes.
+static HANDLE_CLOSE_BARRIER: RwLock<()> = RwLock::new(());
 
 fn blocking() -> bool {
     LEASE_COUNT.load(Ordering::Acquire) > 0
@@ -618,6 +624,9 @@ unsafe fn wide_has_hid_prefix(path: *const u16) -> bool {
     ];
     for (index, &unit) in expected.iter().enumerate() {
         let actual = unsafe { *path.add(index) };
+        if actual == 0 {
+            return false;
+        }
         if index == 2 {
             if actual != b'?' as u16 && actual != b'.' as u16 {
                 return false;
@@ -636,6 +645,9 @@ unsafe fn narrow_has_hid_prefix(path: *const u8) -> bool {
     let expected = [b'\\', b'\\', 0, b'\\', b'h', b'i', b'd'];
     for (index, &unit) in expected.iter().enumerate() {
         let actual = unsafe { *path.add(index) };
+        if actual == 0 {
+            return false;
+        }
         if index == 2 {
             if actual != b'?' && actual != b'.' {
                 return false;
@@ -856,6 +868,9 @@ unsafe extern "system" fn nt_device_io_control_file_detour(
 }
 
 unsafe extern "system" fn nt_close_detour(handle: HANDLE) -> i32 {
+    let _close_guard = HANDLE_CLOSE_BARRIER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     forget_handle(handle);
     let original: NtCloseFn = unsafe { load_function(&NT_CLOSE) };
     unsafe { original(handle) }
@@ -1261,7 +1276,11 @@ fn query_until_sized(
             return None;
         }
         buffer.clear();
-        buffer.resize(capacity.div_ceil(size_of::<u64>()), 0);
+        let element_count = capacity.div_ceil(size_of::<u64>());
+        if element_count > buffer.capacity() && buffer.try_reserve_exact(element_count).is_err() {
+            return None;
+        }
+        buffer.resize(element_count, 0);
         let length = u32::try_from(size_of_val(buffer.as_slice())).unwrap_or(u32::MAX);
         let mut required = 0;
         let status = query(buffer.as_mut_ptr().cast(), length, &mut required);
@@ -1269,9 +1288,9 @@ fn query_until_sized(
             return (status >= 0).then_some(buffer);
         }
         capacity = if required as usize > capacity {
-            required as usize + (1usize << 16)
+            (required as usize).saturating_add(1usize << 16)
         } else {
-            capacity * 2
+            capacity.saturating_mul(2)
         };
     }
     None
@@ -1325,10 +1344,14 @@ fn process_handle_entries() -> Option<Vec<(HANDLE, u32)>> {
     // accepting a no-op revocation: this process always owns handles, so zero
     // entries means the reply was not understood, not that there is nothing to
     // revoke.
-    let entries: Vec<_> = unsafe { handle_entries::<ProcessHandleEntry>(&buffer) }
-        .iter()
-        .map(|entry| (entry.handle_value, entry.object_type_index))
-        .collect();
+    let raw_entries = unsafe { handle_entries::<ProcessHandleEntry>(&buffer) };
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(raw_entries.len()).ok()?;
+    entries.extend(
+        raw_entries
+            .iter()
+            .map(|entry| (entry.handle_value, entry.object_type_index)),
+    );
     (!entries.is_empty()).then_some(entries)
 }
 
@@ -1345,11 +1368,15 @@ fn system_handle_entries() -> Option<Vec<(HANDLE, u32)>> {
         query(SYSTEM_EXTENDED_HANDLE_INFORMATION, data, length, required)
     })?;
     let current_process = unsafe { GetCurrentProcessId() } as usize;
-    let entries: Vec<_> = unsafe { handle_entries::<SystemHandleEntryEx>(&buffer) }
-        .iter()
-        .filter(|entry| entry.process_id == current_process)
-        .map(|entry| (entry.handle_value as HANDLE, entry.object_type_index as u32))
-        .collect();
+    let raw_entries = unsafe { handle_entries::<SystemHandleEntryEx>(&buffer) };
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(raw_entries.len()).ok()?;
+    entries.extend(
+        raw_entries
+            .iter()
+            .filter(|entry| entry.process_id == current_process)
+            .map(|entry| (entry.handle_value as HANDLE, entry.object_type_index as u32)),
+    );
     (!entries.is_empty()).then_some(entries)
 }
 
@@ -1367,25 +1394,71 @@ fn discover_and_revoke_hid_handles() {
     let close: NtCloseFn = unsafe { load_function(&NT_CLOSE) };
     let mut file_type_index = None;
     for (handle, object_type_index) in entries {
-        if let Some(index) = file_type_index {
-            if object_type_index != index {
+        let mut duplicate = null_mut();
+        {
+            let _close_guard = HANDLE_CLOSE_BARRIER
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == FALSE
+                || duplicate.is_null()
+                || duplicate == INVALID_HANDLE_VALUE
+            {
                 continue;
             }
-        } else if is_file_object(handle) {
+
+            // The duplicate pins the kernel object while it is classified.
+            // Refuse a value that had already been recycled before it could be
+            // pinned. The close barrier removes the check-to-duplicate window
+            // for ordinary NtClose callers.
+            if unsafe { CompareObjectHandles(handle, duplicate) } == FALSE {
+                unsafe { close(duplicate) };
+                continue;
+            }
+        }
+
+        if let Some(index) = file_type_index {
+            if object_type_index != index {
+                unsafe { close(duplicate) };
+                continue;
+            }
+        } else if is_file_object(duplicate) {
             file_type_index = Some(object_type_index);
         } else {
+            unsafe { close(duplicate) };
             continue;
         }
 
-        let classification = probe_file_handle(handle);
-        remember_handle(handle, classification);
-        if classification == HandleClass::Hid {
-            unsafe { CancelIoEx(handle, null()) };
-            forget_handle(handle);
-            if unsafe { close(handle) } >= 0 {
-                LAST_REVOKED_HANDLE_COUNT.fetch_add(1, Ordering::AcqRel);
+        let classification = probe_file_handle(duplicate);
+        {
+            let _close_guard = HANDLE_CLOSE_BARRIER
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Classification can perform synchronous device I/O, so it runs
+            // outside the close barrier against the pinned duplicate. Verify
+            // the original numeric handle a second time immediately before
+            // updating its table entry or closing it.
+            if unsafe { CompareObjectHandles(handle, duplicate) } != FALSE {
+                remember_handle(handle, classification);
+                if classification == HandleClass::Hid {
+                    unsafe { CancelIoEx(handle, null()) };
+                    forget_handle(handle);
+                    if unsafe { close(handle) } >= 0 {
+                        LAST_REVOKED_HANDLE_COUNT.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
             }
         }
+        unsafe { close(duplicate) };
     }
 }
 
@@ -1501,7 +1574,8 @@ fn runtime_recovery_layout(ignore_budget: bool) -> Option<&'static RuntimeRecove
     if let Some(layout) = RECOVERY_LAYOUT.get() {
         return Some(layout);
     }
-    if !ignore_budget && RECOVERY_LAYOUT_ATTEMPTS.load(Ordering::Acquire) >= RECOVERY_LAYOUT_MAX_ATTEMPTS
+    if !ignore_budget
+        && RECOVERY_LAYOUT_ATTEMPTS.load(Ordering::Acquire) >= RECOVERY_LAYOUT_MAX_ATTEMPTS
     {
         return None;
     }
@@ -1813,9 +1887,7 @@ fn refresh_sdl_hidapi_devices() -> bool {
     let current_process = unsafe { GetCurrentProcessId() };
     let mut after: HWND = null_mut();
     let window = loop {
-        let candidate = unsafe {
-            FindWindowExW(HWND_MESSAGE, after, class_name.as_ptr(), null())
-        };
+        let candidate = unsafe { FindWindowExW(HWND_MESSAGE, after, class_name.as_ptr(), null()) };
         if candidate.is_null() {
             return false;
         }
@@ -1939,15 +2011,15 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
         if !ensure_hooks_installed() {
             ResultCode::HookInstallFailed
         } else {
-        let leases = LEASE_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
-        lease = true;
-        if leases == 1 {
-            // A fresh acquire is the natural retry point for the bounded caches.
-            HID_THREAD_ATTEMPTS.store(0, Ordering::Release);
-            RECOVERY_LAYOUT_ATTEMPTS.store(0, Ordering::Release);
-            discover_and_revoke_hid_handles();
-        }
-        ResultCode::Ok
+            let leases = LEASE_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
+            lease = true;
+            if leases == 1 {
+                // A fresh acquire is the natural retry point for the bounded caches.
+                HID_THREAD_ATTEMPTS.store(0, Ordering::Release);
+                RECOVERY_LAYOUT_ATTEMPTS.store(0, Ordering::Release);
+                discover_and_revoke_hid_handles();
+            }
+            ResultCode::Ok
         }
     } else if request.command == Command::QueryStatus as u16 {
         ResultCode::Ok
@@ -2025,8 +2097,8 @@ fn report_load_vector(module: HMODULE) -> Vector {
     // the call stops reporting a full buffer.
     let mut buffer = vec![0u16; 260];
     let length = loop {
-        let length =
-            unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        let length = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) }
+            as usize;
         if length == 0 {
             break 0;
         }
@@ -2487,8 +2559,14 @@ mod tests {
     #[test]
     fn control_pipe_sddl_drops_the_default_everyone_and_anonymous_read_aces() {
         let sddl = control_pipe_sddl(SAMPLE_OWNER);
-        assert!(!sddl.contains(";WD)"), "Everyone survived the scoped DACL: {sddl}");
-        assert!(!sddl.contains(";AN)"), "ANONYMOUS survived the scoped DACL: {sddl}");
+        assert!(
+            !sddl.contains(";WD)"),
+            "Everyone survived the scoped DACL: {sddl}"
+        );
+        assert!(
+            !sddl.contains(";AN)"),
+            "ANONYMOUS survived the scoped DACL: {sddl}"
+        );
     }
 
     #[test]
@@ -2522,10 +2600,14 @@ mod tests {
         while unsafe { *text.add(length) } != 0 {
             length += 1;
         }
-        let rendered = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        let rendered =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
         unsafe { LocalFree(text.cast::<c_void>()) };
         assert!(rendered.contains(";SY)"), "SYSTEM ACE missing: {rendered}");
-        assert!(rendered.contains(";BA)"), "Administrators ACE missing: {rendered}");
+        assert!(
+            rendered.contains(";BA)"),
+            "Administrators ACE missing: {rendered}"
+        );
         assert!(
             rendered.contains(SAMPLE_OWNER),
             "owner ACE missing: {rendered}"
@@ -2559,5 +2641,21 @@ mod tests {
     fn current_token_owner_sid_returns_a_string_sid() {
         let owner = current_token_owner_sid().expect("the current token must expose an owner");
         assert!(owner.starts_with("S-1-"), "unexpected owner SID: {owner}");
+    }
+
+    #[test]
+    fn hid_prefix_probes_stop_at_a_short_nul_terminated_path() {
+        let short_wide = [b'\\' as u16, 0];
+        let short_narrow = [b'\\', 0];
+        assert!(!unsafe { wide_has_hid_prefix(short_wide.as_ptr()) });
+        assert!(!unsafe { narrow_has_hid_prefix(short_narrow.as_ptr()) });
+    }
+
+    #[test]
+    fn hid_prefix_probes_accept_complete_dos_device_paths() {
+        let wide: Vec<u16> = r"\\?\hid#example".encode_utf16().chain(Some(0)).collect();
+        let narrow = b"\\\\?\\hid#example\0";
+        assert!(unsafe { wide_has_hid_prefix(wide.as_ptr()) });
+        assert!(unsafe { narrow_has_hid_prefix(narrow.as_ptr()) });
     }
 }

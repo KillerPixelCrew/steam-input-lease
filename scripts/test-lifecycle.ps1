@@ -21,13 +21,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
+$rustTarget = 'x86_64-pc-windows-msvc'
 $output = Join-Path $workspace 'target'
 if ($Profile -eq 'release') {
-    $output = Join-Path $output 'release'
-    cargo build --workspace --release --manifest-path (Join-Path $workspace 'Cargo.toml')
+    $output = Join-Path $output "$rustTarget\release"
+    cargo build --workspace --release --target $rustTarget --manifest-path (Join-Path $workspace 'Cargo.toml')
 } else {
-    $output = Join-Path $output 'debug'
-    cargo build --workspace --manifest-path (Join-Path $workspace 'Cargo.toml')
+    $output = Join-Path $output "$rustTarget\debug"
+    cargo build --workspace --target $rustTarget --manifest-path (Join-Path $workspace 'Cargo.toml')
 }
 if ($LASTEXITCODE -ne 0) {
     throw "Cargo build failed with exit code $LASTEXITCODE"
@@ -92,19 +93,38 @@ try {
         throw "Wrapper returned $LASTEXITCODE; expected child exit code 23"
     }
 
+    # The root exits immediately after spawning a delayed descendant. A wrapper
+    # that waits only for the root returns before this marker exists; a real job
+    # tree wait returns only after the descendant has written it and exited.
+    $descendantMarker = Join-Path $resolvedTraceDirectory 'descendant-completed.txt'
+    & $launcher --target-name steam-input-test-target.exe --payload $payload -- `
+        $target --child-tree $descendantMarker
+    if ($LASTEXITCODE -ne 23) {
+        throw "Process-tree wrapper returned $LASTEXITCODE; expected root exit code 23"
+    }
+    if (-not (Test-Path -LiteralPath $descendantMarker -PathType Leaf)) {
+        throw "Wrapper returned before its delayed descendant completed"
+    }
+
     & $launcher --target-name steam-input-test-target.exe --status
     if ($LASTEXITCODE -ne 0) {
         throw "Payload status query returned $LASTEXITCODE"
     }
 
-    $trace = Get-ChildItem -LiteralPath $resolvedTraceDirectory `
-        -Filter 'steam-input-gate-*.log' | Select-Object -First 1
-    if ($null -eq $trace) {
-        throw "Injected payload did not produce its isolated startup trace"
-    }
-    $traceContent = Get-Content -LiteralPath $trace.FullName -Raw
-    if ($traceContent -notmatch 'control pipe listening') {
-        throw "Startup trace did not reach control-pipe readiness"
+    # The temp-directory override is deliberately compiled out of shipped
+    # release DLLs. Validate the isolated trace only for the debug payload;
+    # release still exercises the complete lease/job lifecycle above without
+    # reading or deleting the user's real %LOCALAPPDATA% trace.
+    if ($Profile -eq 'debug') {
+        $trace = Get-ChildItem -LiteralPath $resolvedTraceDirectory `
+            -Filter 'steam-input-gate-*.log' | Select-Object -First 1
+        if ($null -eq $trace) {
+            throw "Injected payload did not produce its isolated startup trace"
+        }
+        $traceContent = Get-Content -LiteralPath $trace.FullName -Raw
+        if ($traceContent -notmatch 'control pipe listening') {
+            throw "Startup trace did not reach control-pipe readiness"
+        }
     }
 } finally {
     if ($null -ne $targetProcess) {

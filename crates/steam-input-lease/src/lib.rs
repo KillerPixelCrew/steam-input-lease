@@ -46,8 +46,9 @@ use steam_input_recovery::{
     select_progressing_candidate,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BAD_LENGTH, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, FALSE, HANDLE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_BAD_LENGTH, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PIPE_BUSY,
+    ERROR_PROCESS_ABORTED, FALSE, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, TRUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
@@ -59,8 +60,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JobObjectBasicAccountingInformation, QueryInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
@@ -71,10 +74,10 @@ use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, CreateRemoteThread,
-    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetExitCodeThread, INFINITE,
-    IsWow64Process2, OpenProcess, PROCESS_CREATE_THREAD, PROCESS_INFORMATION,
-    PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-    ResumeThread, STARTUPINFOW, WaitForSingleObject,
+    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetExitCodeThread, IsWow64Process2,
+    OpenProcess, PROCESS_CREATE_THREAD, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, ResumeThread, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_DEVICECHANGE,
@@ -246,12 +249,29 @@ pub struct ReleaseOutcome {
 pub enum Error {
     /// No matching process exists in the caller's Windows session.
     TargetNotFound(String),
+    /// More than one matching process exists in the caller's Windows session,
+    /// so choosing an injection target by name would be unsafe.
+    AmbiguousTarget {
+        /// Executable name that matched multiple processes.
+        name: String,
+        /// First matching process identifier.
+        first_process_id: u32,
+        /// Second matching process identifier.
+        second_process_id: u32,
+    },
     /// Injection was required, but the configured payload path does not exist.
     PayloadNotFound(PathBuf),
     /// The host executable and target process use different architectures.
     ArchitectureMismatch,
     /// The target payload rejected or returned an incompatible wire message.
     Protocol(String),
+    /// The payload pipe was absent or remained busy until its bounded deadline.
+    PayloadUnavailable {
+        /// Operation-specific explanation of what did not answer.
+        context: &'static str,
+        /// Last expected pipe error observed before the deadline.
+        source: io::Error,
+    },
     /// Runtime analysis could not prove a safe Steam recovery target.
     UnsupportedSteamBuild(String),
     /// A Win32 operation failed and supplied an OS error code.
@@ -281,6 +301,14 @@ impl fmt::Display for Error {
             Self::TargetNotFound(name) => {
                 write!(formatter, "target process is not running: {name}")
             }
+            Self::AmbiguousTarget {
+                name,
+                first_process_id,
+                second_process_id,
+            } => write!(
+                formatter,
+                "multiple {name} processes run in this Windows session ({first_process_id} and {second_process_id}); refusing to choose an injection target"
+            ),
             Self::PayloadNotFound(path) => {
                 write!(formatter, "payload not found: {}", path.display())
             }
@@ -290,6 +318,9 @@ impl fmt::Display for Error {
             Self::Protocol(message)
             | Self::UnsupportedSteamBuild(message)
             | Self::Message(message) => formatter.write_str(message),
+            Self::PayloadUnavailable { context, source } => {
+                write!(formatter, "{context}: {source}")
+            }
             Self::Windows { operation, source } => write!(formatter, "{operation}: {source}"),
         }
     }
@@ -298,7 +329,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Windows { source, .. } => Some(source),
+            Self::PayloadUnavailable { source, .. } | Self::Windows { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -336,18 +367,19 @@ impl Client {
     ///
     /// # Errors
     /// [`Error::TargetNotFound`] when no process of that name runs in the
-    /// caller's session. Steam is simply not running; the caller should treat
-    /// the lease as unavailable rather than retry immediately.
+    /// caller's session, [`Error::AmbiguousTarget`] when more than one does, or
+    /// [`Error::Windows`] when session-scoped process enumeration fails. Steam
+    /// simply not running is an availability condition, not a retry loop.
     pub fn process_id(&self) -> Result<u32> {
         find_process(&self.options.target_name)
-            .ok_or_else(|| Error::TargetNotFound(self.options.target_name.clone()))
     }
 
     /// Ensures that the payload is loaded, without acquiring a block lease.
     ///
     /// # Errors
     /// Everything [`Client::acquire`] can return except that no lease is taken:
-    /// [`Error::TargetNotFound`], [`Error::PayloadNotFound`],
+    /// [`Error::TargetNotFound`], [`Error::AmbiguousTarget`],
+    /// [`Error::PayloadNotFound`], [`Error::PayloadUnavailable`],
     /// [`Error::ArchitectureMismatch`], [`Error::Windows`], [`Error::Message`]
     /// or [`Error::Protocol`]. Nothing in Steam has been changed on failure.
     pub fn ensure_payload(&self) -> Result<Status> {
@@ -359,9 +391,11 @@ impl Client {
     /// Queries an already loaded payload. This never injects.
     ///
     /// # Errors
-    /// [`Error::TargetNotFound`] when Steam is not running, [`Error::Windows`]
-    /// when the payload pipe does not answer within the short fixed probe
-    /// timeout, or [`Error::Protocol`] for an incompatible payload. A failure
+    /// [`Error::TargetNotFound`] when Steam is not running,
+    /// [`Error::AmbiguousTarget`] for duplicate same-name targets,
+    /// [`Error::PayloadUnavailable`] when the payload pipe does not answer
+    /// within the short fixed probe timeout, [`Error::Windows`] for other pipe
+    /// failures, or [`Error::Protocol`] for an incompatible payload. A failure
     /// means "no usable payload right now", never that blocking changed.
     pub fn status(&self) -> Result<Status> {
         let process_id = self.process_id()?;
@@ -373,11 +407,13 @@ impl Client {
     ///
     /// # Errors
     /// [`Error::TargetNotFound`] when Steam is not running,
+    /// [`Error::AmbiguousTarget`] when target selection by name is unsafe,
     /// [`Error::PayloadNotFound`] when injection was required but
     /// `steam_input_gate.dll` is missing beside the caller,
     /// [`Error::ArchitectureMismatch`] for a bitness mismatch,
-    /// [`Error::Windows`] for a failed Win32 step, [`Error::Message`] when the
-    /// payload loaded but its control pipe never appeared, or
+    /// [`Error::Windows`] for a failed Win32 step,
+    /// [`Error::PayloadUnavailable`] when the resident/new payload pipe misses
+    /// its deadline, or
     /// [`Error::Protocol`] for an incompatible payload. No lease exists in any
     /// of those cases, so the caller should fail open and run without one.
     pub fn acquire(&self) -> Result<Lease> {
@@ -399,10 +435,15 @@ impl Client {
     /// Release is attempted even when process creation or waiting fails.
     ///
     /// Returns the root process exit code and the final release handshake.
+    /// If job accounting becomes unreadable after resume, the library aborts
+    /// the now-untrackable tree and returns `ERROR_PROCESS_ABORTED` as the exit
+    /// code instead of returning an error that could make a fail-open caller
+    /// launch the already-started target a second time.
     ///
     /// # Errors
-    /// [`Error::Message`] for an empty command, everything [`Client::acquire`]
-    /// can return, and [`Error::Windows`] when `CreateProcessW` fails. An error
+    /// [`Error::Message`] for an empty command or embedded NUL, everything
+    /// [`Client::acquire`] can return, and [`Error::Windows`] when a
+    /// pre-resume process/job operation fails. An error
     /// means the target NEVER STARTED, so the caller may safely launch it
     /// itself; a failed release after a completed run is deliberately not an
     /// error, or the caller would start a finished game a second time — it is
@@ -419,6 +460,16 @@ impl Client {
             .collect();
         if arguments.is_empty() {
             return Err(Error::Message("the wrapped command is empty".into()));
+        }
+        if arguments[0].is_empty() {
+            return Err(Error::Message(
+                "the wrapped executable name is empty".into(),
+            ));
+        }
+        if let Some(index) = arguments.iter().position(|argument| argument.contains(&0)) {
+            return Err(Error::Message(format!(
+                "wrapped command argument {index} contains a NUL character"
+            )));
         }
         let lease = self.acquire()?;
         let launched = launch_and_wait(&arguments);
@@ -485,26 +536,31 @@ impl Client {
 
     /// Connects to a payload Steam already loaded, and never injects.
     fn connect_only(&self, process_id: u32) -> Result<OwnedHandle> {
-        connect_pipe(process_id, self.options.connect_timeout).map_err(|_| {
-            Error::Message(
-                "no resident Steam Input payload answered; Steam Input Management is off,                  its proxy is not deployed, or Steam has not restarted since it was"
-                    .into(),
-            )
+        connect_pipe(process_id, self.options.connect_timeout).map_err(|error| match error {
+            Error::PayloadUnavailable { source, .. } => Error::PayloadUnavailable {
+                context: "no resident Steam Input payload answered; Steam Input Management is off, its proxy is not deployed, or Steam has not restarted since deployment",
+                source,
+            },
+            other => other,
         })
     }
 
     fn connect_or_inject(&self, process_id: u32) -> Result<OwnedHandle> {
-        if let Ok(pipe) = connect_pipe(process_id, Duration::from_millis(20)) {
-            return Ok(pipe);
+        match connect_pipe(process_id, Duration::from_millis(20)) {
+            Ok(pipe) => return Ok(pipe),
+            Err(Error::PayloadUnavailable { .. }) => {}
+            Err(error) => return Err(error),
         }
         if !self.options.payload_path.is_file() {
             return Err(Error::PayloadNotFound(self.options.payload_path.clone()));
         }
         inject_payload(process_id, &self.options.payload_path)?;
-        connect_pipe(process_id, self.options.connect_timeout).map_err(|_| {
-            Error::Message(
-                "the payload loaded, but its control pipe did not become available".into(),
-            )
+        connect_pipe(process_id, self.options.connect_timeout).map_err(|error| match error {
+            Error::PayloadUnavailable { source, .. } => Error::PayloadUnavailable {
+                context: "the payload loaded, but its control pipe did not become available",
+                source,
+            },
+            other => other,
         })
     }
 }
@@ -612,7 +668,10 @@ fn wide_eq_ignore_ascii_case(wide: &[u16], ascii: &str) -> bool {
     // The `unit < 128` test is required rather than cosmetic: without it a
     // non-ASCII code unit could alias onto an ASCII byte once truncated by
     // `as u8` and false-match a name that selects an injection target.
-    let length = wide.iter().position(|&unit| unit == 0).unwrap_or(wide.len());
+    let length = wide
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(wide.len());
     length == ascii.len()
         && wide[..length]
             .iter()
@@ -620,33 +679,63 @@ fn wide_eq_ignore_ascii_case(wide: &[u16], ascii: &str) -> bool {
             .all(|(&unit, byte)| unit < 128 && (unit as u8).eq_ignore_ascii_case(&byte))
 }
 
-fn find_process(process_name: &str) -> Option<u32> {
+fn find_process(process_name: &str) -> Result<u32> {
     // Restrict discovery to the caller's interactive session so a service or
     // second signed-in user cannot accidentally become the injection target.
+    if process_name.contains('\0') {
+        return Err(Error::Message(
+            "the target process name contains a NUL character".into(),
+        ));
+    }
     unsafe {
         let mut current_session = 0;
         if ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session) == FALSE {
-            return None;
+            return Err(Error::windows(
+                "could not resolve the caller's Windows session",
+            ));
         }
         let snapshot = OwnedHandle::from_raw(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
         if snapshot.raw() == INVALID_HANDLE_VALUE {
-            return None;
+            return Err(Error::windows("could not snapshot running processes"));
         }
         let mut entry: PROCESSENTRY32W = zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snapshot.raw(), &mut entry) == FALSE {
-            return None;
+            let source = io::Error::last_os_error();
+            return if source.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                Err(Error::TargetNotFound(process_name.into()))
+            } else {
+                Err(Error::Windows {
+                    operation: "could not enumerate running processes",
+                    source,
+                })
+            };
         }
+        let mut matched = None;
         loop {
             let mut candidate_session = 0;
             if wide_eq_ignore_ascii_case(&entry.szExeFile, process_name)
                 && ProcessIdToSessionId(entry.th32ProcessID, &mut candidate_session) != FALSE
                 && candidate_session == current_session
             {
-                return Some(entry.th32ProcessID);
+                if let Some(first_process_id) = matched {
+                    return Err(Error::AmbiguousTarget {
+                        name: process_name.into(),
+                        first_process_id,
+                        second_process_id: entry.th32ProcessID,
+                    });
+                }
+                matched = Some(entry.th32ProcessID);
             }
             if Process32NextW(snapshot.raw(), &mut entry) == FALSE {
-                return None;
+                let source = io::Error::last_os_error();
+                if source.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                    return Err(Error::Windows {
+                        operation: "could not enumerate running processes",
+                        source,
+                    });
+                }
+                return matched.ok_or_else(|| Error::TargetNotFound(process_name.into()));
             }
         }
     }
@@ -1029,20 +1118,22 @@ fn describe_candidate_movement(
     candidates
         .iter()
         .enumerate()
-        .map(|(index, address)| match (before.get(index), after.get(index)) {
-            (Some(b), Some(a)) => {
-                let moved = b.deadline_bits != a.deadline_bits || b.counter != a.counter;
-                format!(
-                    "{address:#x}: deadline {:#018x}->{:#018x} counter {}->{} {}",
-                    b.deadline_bits,
-                    a.deadline_bits,
-                    b.counter,
-                    a.counter,
-                    if moved { "MOVED" } else { "still" },
-                )
-            }
-            _ => format!("{address:#x}: unsampled"),
-        })
+        .map(
+            |(index, address)| match (before.get(index), after.get(index)) {
+                (Some(b), Some(a)) => {
+                    let moved = b.deadline_bits != a.deadline_bits || b.counter != a.counter;
+                    format!(
+                        "{address:#x}: deadline {:#018x}->{:#018x} counter {}->{} {}",
+                        b.deadline_bits,
+                        a.deadline_bits,
+                        b.counter,
+                        a.counter,
+                        if moved { "MOVED" } else { "still" },
+                    )
+                }
+                _ => format!("{address:#x}: unsampled"),
+            },
+        )
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -1205,6 +1296,11 @@ fn inject_payload(process_id: u32, payload: &Path) -> Result<()> {
             operation: "could not resolve payload path",
             source,
         })?;
+        if absolute.as_os_str().encode_wide().any(|unit| unit == 0) {
+            return Err(Error::Message(
+                "the payload path contains a NUL character".into(),
+            ));
+        }
         let payload_wide = wide_nul(absolute.as_os_str());
         let bytes = payload_wide.len() * size_of::<u16>();
         let remote_path = VirtualAllocEx(
@@ -1301,8 +1397,8 @@ fn connect_pipe(process_id: u32, timeout: Duration) -> Result<OwnedHandle> {
                 });
             }
             if Instant::now() >= deadline {
-                return Err(Error::Windows {
-                    operation: "timed out connecting to payload pipe",
+                return Err(Error::PayloadUnavailable {
+                    context: "timed out connecting to payload pipe",
                     source: error,
                 });
             }
@@ -1332,9 +1428,13 @@ fn exchange(pipe: HANDLE, command: Command) -> Result<Response> {
             &mut transferred,
             null_mut(),
         ) == FALSE
-            || transferred != size_of::<Request>() as u32
         {
             return Err(Error::windows("could not send command to payload"));
+        }
+        if transferred != size_of::<Request>() as u32 {
+            return Err(Error::Protocol(
+                "the payload pipe accepted an incomplete command".into(),
+            ));
         }
         let mut response: Response = zeroed();
         if ReadFile(
@@ -1344,9 +1444,13 @@ fn exchange(pipe: HANDLE, command: Command) -> Result<Response> {
             &mut transferred,
             null_mut(),
         ) == FALSE
-            || transferred != size_of::<Response>() as u32
         {
             return Err(Error::windows("could not read payload response"));
+        }
+        if transferred != size_of::<Response>() as u32 {
+            return Err(Error::Protocol(
+                "the payload returned an incomplete response".into(),
+            ));
         }
         if !response.is_valid() {
             return Err(Error::Protocol(
@@ -1389,6 +1493,25 @@ fn quote_argument(value: &[u16]) -> Vec<u16> {
     result
 }
 
+unsafe fn abort_unstarted_process(process: HANDLE, cause: Error) -> Error {
+    if unsafe { TerminateProcess(process, ERROR_PROCESS_ABORTED) } == FALSE {
+        return Error::Message(format!(
+            "{cause}; additionally, the suspended process could not be terminated: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    match unsafe { WaitForSingleObject(process, 5_000) } {
+        WAIT_OBJECT_0 => cause,
+        WAIT_TIMEOUT => Error::Message(format!(
+            "{cause}; additionally, the suspended process did not terminate within 5 seconds"
+        )),
+        _ => Error::Message(format!(
+            "{cause}; additionally, waiting for suspended-process termination failed: {}",
+            io::Error::last_os_error()
+        )),
+    }
+}
+
 fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
     let mut command_line = Vec::new();
     for argument in arguments {
@@ -1423,39 +1546,75 @@ fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
         // Assign before ResumeThread so descendants created immediately by a
         // launcher cannot escape the job/process-tree lifetime.
         let job_raw = CreateJobObjectW(null(), null());
-        let job = (!job_raw.is_null()).then(|| OwnedHandle::from_raw(job_raw));
-        let assigned = job
-            .as_ref()
-            .is_some_and(|job| AssignProcessToJobObject(job.raw(), process_handle.raw()) != FALSE);
-        ResumeThread(thread_handle.raw());
+        if job_raw.is_null() {
+            let error = Error::windows("could not create wrapped-process job object");
+            return Err(abort_unstarted_process(process_handle.raw(), error));
+        }
+        let job = OwnedHandle::from_raw(job_raw);
+        if AssignProcessToJobObject(job.raw(), process_handle.raw()) == FALSE {
+            let error = Error::windows("could not assign wrapped process to its job object");
+            return Err(abort_unstarted_process(process_handle.raw(), error));
+        }
+        if ResumeThread(thread_handle.raw()) == u32::MAX {
+            let error = Error::windows("could not resume wrapped process");
+            if TerminateJobObject(job.raw(), ERROR_PROCESS_ABORTED) == FALSE {
+                return Err(abort_unstarted_process(process_handle.raw(), error));
+            }
+            if WaitForSingleObject(process_handle.raw(), 5_000) != WAIT_OBJECT_0 {
+                return Err(Error::Message(format!(
+                    "{error}; the failed wrapped process did not terminate cleanly"
+                )));
+            }
+            return Err(error);
+        }
         drop(thread_handle);
 
-        if assigned {
-            loop {
-                let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
-                if QueryInformationJobObject(
-                    job.as_ref().unwrap().raw(),
-                    JobObjectBasicAccountingInformation,
-                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                    null_mut(),
-                ) == FALSE
-                    || accounting.ActiveProcesses == 0
-                {
-                    break;
+        loop {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+            if QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            ) == FALSE
+            {
+                // The target has started, so this path must never return Err:
+                // fail-open callers would launch it a second time. Abort the
+                // untrackable tree and return a synthetic process exit code.
+                if TerminateJobObject(job.raw(), ERROR_PROCESS_ABORTED) == FALSE {
+                    // If direct job termination itself is unavailable, make
+                    // closing our known-valid job handle the tree kill switch.
+                    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+                    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    if SetInformationJobObject(
+                        job.raw(),
+                        JobObjectExtendedLimitInformation,
+                        (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    ) == FALSE
+                    {
+                        // Last-resort containment for the root. The synthetic
+                        // result still tells the caller the run was aborted.
+                        let _ = TerminateProcess(process_handle.raw(), ERROR_PROCESS_ABORTED);
+                    }
                 }
-                thread::sleep(Duration::from_millis(25));
+                drop(job);
+                let _ = WaitForSingleObject(process_handle.raw(), 5_000);
+                return Ok(ERROR_PROCESS_ABORTED);
             }
-        } else {
-            WaitForSingleObject(process_handle.raw(), INFINITE);
+            if accounting.ActiveProcesses == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
         }
 
-        // The tree has already run and exited by here, so an unreadable exit code
-        // is reported as zero rather than as an error: the caller treats an error
-        // as "the target never started" and would run it again.
+        // The tree has already run and exited by here. An unreadable exit code
+        // becomes a distinct abort result rather than zero (false success) or
+        // Err (which would make a fail-open caller start the target again).
         let mut exit_code = 0;
         if GetExitCodeProcess(process_handle.raw(), &mut exit_code) == FALSE {
-            exit_code = 0;
+            exit_code = ERROR_PROCESS_ABORTED;
         }
         Ok(exit_code)
     }
@@ -1482,6 +1641,28 @@ mod tests {
                 &r#"a\"b"#.encode_utf16().collect::<Vec<_>>()
             )),
             "\"a\\\\\\\"b\""
+        );
+    }
+
+    #[test]
+    fn wrapped_commands_reject_embedded_nuls_before_process_discovery() {
+        let error = Client::default()
+            .run_wrapped(["test\0target.exe"])
+            .expect_err("an embedded NUL must not reach CreateProcessW");
+        assert!(
+            matches!(&error, Error::Message(message) if message.contains("NUL")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn wrapped_commands_reject_an_empty_executable_before_process_discovery() {
+        let error = Client::default()
+            .run_wrapped([""])
+            .expect_err("an empty executable must be rejected");
+        assert!(
+            matches!(&error, Error::Message(message) if message.contains("executable")),
+            "unexpected error: {error}"
         );
     }
 }

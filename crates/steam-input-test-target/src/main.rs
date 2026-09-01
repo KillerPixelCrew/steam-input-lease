@@ -6,7 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -96,6 +96,45 @@ fn main() -> ExitCode {
     if arguments.as_slice() == ["--child"] {
         println!("test target child completed");
         return ExitCode::from(23);
+    }
+    if arguments.first().map(String::as_str) == Some("--child-tree") {
+        let Some(marker) = arguments.get(1) else {
+            return ExitCode::from(2);
+        };
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                eprintln!("could not resolve test target path: {error}");
+                return ExitCode::from(27);
+            }
+        };
+        match Command::new(executable)
+            .arg("--delayed-marker")
+            .arg(marker)
+            .spawn()
+        {
+            Ok(_) => {
+                println!("test target root spawned a delayed descendant");
+                return ExitCode::from(23);
+            }
+            Err(error) => {
+                eprintln!("could not spawn test descendant: {error}");
+                return ExitCode::from(27);
+            }
+        }
+    }
+    if arguments.first().map(String::as_str) == Some("--delayed-marker") {
+        let Some(marker) = arguments.get(1) else {
+            return ExitCode::from(2);
+        };
+        thread::sleep(Duration::from_millis(750));
+        return match std::fs::write(marker, b"descendant completed\n") {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("could not write descendant marker: {error}");
+                ExitCode::from(28)
+            }
+        };
     }
     if arguments.first().map(String::as_str) == Some("--serve") {
         let Some(port) = arguments.get(1).and_then(|value| value.parse().ok()) else {

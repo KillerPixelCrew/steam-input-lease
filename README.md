@@ -193,11 +193,21 @@ Or wrap a whole process tree — created suspended, assigned to a job object, th
 resumed, so descendants cannot escape the wait:
 
 ```rust
-let exit_code = Client::default().run_wrapped([
+let run = Client::default().run_wrapped([
     r"D:\Games\Example\game.exe",
     "--direct-input",
 ])?;
+println!("root exit code: {}", run.exit_code);
+if let Err(error) = run.release {
+    eprintln!("release handshake failed after the process tree exited: {error}");
+}
 ```
+
+Job creation, assignment, and thread resume are all required before the target
+can run. If accounting fails only after resume, the library terminates the
+untrackable job and reports `ERROR_PROCESS_ABORTED` as the process result; it
+does not return a pre-start error that could make a fail-open caller launch the
+same target twice.
 
 `Lease::release` is the observable path: it sends `ReleaseLease` and waits for
 the response. Dropping a `Lease` closes the pipe and is crash-safe, but reports
@@ -228,9 +238,11 @@ a recovery failure must not present a released lease as a failed one.
 | `Error` variant | Meaning |
 |---|---|
 | `TargetNotFound` | No matching process in this Windows session |
+| `AmbiguousTarget` | More than one same-name target exists in this session; no target was chosen |
 | `PayloadNotFound` | Injection needed but the DLL is absent |
 | `ArchitectureMismatch` | Host and target architectures differ |
 | `Protocol` | Pipe message, version, or result validation failed |
+| `PayloadUnavailable` | The resident or newly loaded payload pipe missed its bounded deadline |
 | `UnsupportedSteamBuild` | Analysis could not prove a unique safe recovery target |
 | `Windows` | A Win32 call failed; the source carries its OS code |
 | `Message` | A validated lifecycle condition failed |
@@ -248,6 +260,10 @@ SilStatus status = {0};
 SilReleaseOutcome outcome = {0};
 SilClientOptions options = {0};   /* all defaults */
 
+if (sil_abi_version() != 4) {
+    fprintf(stderr, "incompatible Steam Input Lease ABI\n");
+    return 1;
+}
 if (sil_client_create(&options, &client) != SIL_OK) {
     fprintf(stderr, "%s\n", sil_last_error_message());
     return 1;
@@ -311,7 +327,7 @@ an empty string. Never modify or free it.
 The .NET 8 binding wraps both opaque handle types in `SafeHandle`.
 
 ```csharp
-using SteamInputLease;
+using SteamInterop;
 
 using var client = new SteamInputClient();
 
@@ -337,13 +353,19 @@ using var client = new SteamInputClient(new SteamInputClientOptions
     ConnectTimeout = TimeSpan.FromSeconds(10),
 });
 
-uint exitCode = client.RunWrapped(@"D:\Games\Example\game.exe", "--direct-input");
+SteamInputWrappedRun run = client.RunWrapped(
+    @"D:\Games\Example\game.exe", "--direct-input");
+uint exitCode = run.ExitCode;
+if (!run.Release.RecoveryRequested)
+{
+    Console.Error.WriteLine(run.Release.RecoveryMessage);
+}
 ```
 
 | Member | Notes |
 |---|---|
 | `SteamInputClient` | `IDisposable`; `Acquire`, `RunWrapped`, `EnsurePayload`, `GetStatus`, `Rescan`, `CheckRecovery` |
-| `SteamInputClientOptions` | `TargetName`, `PayloadPath`, `ConnectTimeout` (all `init`) |
+| `SteamInputClientOptions` | `TargetName`, `PayloadPath`, `ConnectTimeout`, `AllowInjection` (all `init`) |
 | `SteamInputBlockLease` | `InitialStatus`, `Release()`, `Dispose()`; obtained only from `Acquire()` |
 | `SteamInputStatus` | `readonly record struct (ushort Capabilities, uint LeaseCount, uint HidHandleCount, uint LastRevokedHandleCount)` plus `SupportsInternalRecovery` |
 | `SteamControllerRescanResult` | `(double PreviousDeadline, uint ScanCountBefore, uint ScanCountAfter)` |
@@ -351,11 +373,14 @@ uint exitCode = client.RunWrapped(@"D:\Games\Example\game.exe", "--direct-input"
 
 `Release()` performs the explicit handshake and consumes the managed lease;
 `Dispose()` closes the crash-safe pipe if `Release()` was not called.
+The binding calls `sil_abi_version()` before every other native entry point used
+to create a client and refuses any version other than ABI 4.
 
 Available as a project reference or the generated local NuGet package. Build the
 Cargo **release** artifacts first — the package's native assets are conditional
-on `target\release\*.dll` existing, so packing without them silently produces a
-managed-only package.
+on `target\x86_64-pc-windows-msvc\release\*.dll` existing. The standard build
+script creates and verifies those x64 images before packing, so use it instead
+of calling `dotnet pack` directly.
 
 ```powershell
 .\scripts\build.ps1
@@ -391,16 +416,16 @@ becomes `255`. `--status`, `--rescan`, and `--help` return `0`; errors return
 ## Building and testing
 
 ```powershell
-cargo build --workspace --release
+cargo build --workspace --release --target x86_64-pc-windows-msvc
 dotnet build .\bindings\SteamInterop.Net\SteamInterop.Net.csproj -c Release
 ```
 
 Quality gates:
 
 ```powershell
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps; Remove-Item Env:RUSTDOCFLAGS
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+cargo test --workspace --target x86_64-pc-windows-msvc
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps --target x86_64-pc-windows-msvc; Remove-Item Env:RUSTDOCFLAGS
 ```
 
 The library crates use `#![deny(missing_docs)]`, so undocumented public API is a
@@ -421,10 +446,10 @@ then checks that opening a deliberately nonexistent HID-style path:
    payload injected implicitly by the wrapped launcher run;
 3. returns to the ordinary not-blocked error after release.
 
-It also asserts the wrapped child's exit code is propagated exactly (`23`) and
-that the resident payload still answers a non-injecting `--status` query. Steps
-1 and 3 assert only that the result is *not* the blocked error, not a specific
-code.
+It also asserts the wrapped child's exit code is propagated exactly (`23`), a
+delayed descendant is included in the job lifetime after its root exits, and the
+resident payload still answers a non-injecting `--status` query. Steps 1 and 3
+assert only that the result is *not* the blocked error, not a specific code.
 
 ### Package
 
@@ -434,12 +459,14 @@ code.
 
 Builds the workspace and the managed project, then writes the portable layout to
 `artifacts\win-x64` and the NuGet package to `artifacts\packages`. The
-`-Runtime` parameter only relabels the output directory; it does not
-cross-compile.
+native target is explicitly `x86_64-pc-windows-msvc`; the `-Runtime` parameter
+is therefore constrained to `win-x64` and does not cross-compile.
 
-The shipped C# sample (`samples\SteamInputLease.CSharpExample`) reads
-`SIL_TARGET_NAME` and `SIL_PAYLOAD_PATH` from the environment. With no arguments
-it calls `EnsurePayload()`; otherwise it wraps its arguments with `RunWrapped`.
+The shipped C# sample (`samples\SteamInterop.CSharpExample`) reads
+`SIL_TARGET_NAME` and `SIL_PAYLOAD_PATH` from the environment. Supplying a custom
+target explicitly selects diagnostic mode and enables injection for that target;
+the production Steam defaults remain non-injecting. With no arguments the sample
+calls `EnsurePayload()`; otherwise it wraps its arguments with `RunWrapped`.
 
 ## Internals
 
@@ -634,6 +661,7 @@ exists only in `steam-input-test-target` during the isolated test.
 | Symptom | Cause and fix |
 |---|---|
 | `target process is not running: steam.exe` | Steam is not in your session, or the diagnostic target name is wrong |
+| `multiple ... processes run in this Windows session` | Stop the duplicate diagnostic target or address it through a single uniquely named executable; name-based discovery refuses ambiguity |
 | `payload not found` | Keep `steam_input_gate.dll` beside the exe, or set `--payload` / `payload_path` |
 | `OpenProcess failed`, architecture mismatch | Run at a compatible integrity level; do not mix x86 and x64 artifacts |
 | Payload loaded but pipe never appeared | Hook init or server startup failed, or security software interrupted injection |

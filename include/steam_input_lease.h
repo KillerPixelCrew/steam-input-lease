@@ -47,7 +47,7 @@ typedef struct SilClientOptions {
     /** Payload DLL path, or NULL to use the executable-directory default. */
     /* Consulted ONLY when allow_injection is non-zero. */
     const uint16_t* payload_path;
-    /** Pipe startup timeout in milliseconds, or zero for the default. */
+    /** Resident/post-injection pipe wait in milliseconds, or zero for 10 s. */
     uint32_t connect_timeout_ms;
     /*
      * Non-zero to let this client inject the payload when no resident one
@@ -123,14 +123,15 @@ typedef struct SilReleaseOutcome {
  * of a bare SilStatus, so a recovery failure no longer presents a released
  * lease as a failed one.
  *
- * Version 4 added allow_injection to SilClientOptions and made proxy delivery
- * the default: the payload is normally a search-order DLL Steam loads from its
- * own directory, so payload_path and connect_timeout_ms only govern the opt-in
- * injection path. A client left at the defaults can never write into Steam.
- *
  * Version 3 added the release output to sil_client_run_wrapped(), which
  * previously discarded the final handshake — a wrapped game could leave Steam
  * without controller recovery and nothing could report it.
+ *
+ * Version 4 added allow_injection to SilClientOptions and made proxy delivery
+ * the default: the payload is normally a search-order DLL Steam loads from its
+ * own directory, so payload_path governs only the opt-in injection path.
+ * connect_timeout_ms bounds both the resident-payload wait and the wait after
+ * opt-in injection. A client left at the defaults can never write into Steam.
  */
 SIL_API uint32_t sil_abi_version(void);
 

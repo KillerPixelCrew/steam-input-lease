@@ -161,7 +161,7 @@ const DINPUT8_MODULE: &str = "dinput8.dll";
 /// interface was created and handing the caller an uninitialised pointer.
 const E_FAIL: i32 = -2_147_467_259;
 
-/// True only after the worker cached the complete forwarding table.
+/// True only after the worker cached every required forwarding target.
 fn forwarding_ready() -> bool {
     FORWARDING_READY.load(Ordering::Acquire)
 }

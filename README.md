@@ -146,10 +146,11 @@ the pin guards against.
 
 ### The bootstrap block
 
-Every proxy export starts blocked. Until the worker has cached the complete forwarding table, a
+Every proxy export starts blocked. Until the worker has cached every required forwarding target, a
 call returns its disconnected fallback (`ERROR_DEVICE_NOT_CONNECTED`, `E_FAIL`, or nothing) without
 allocating, resolving an export or entering the Windows loader. The worker loads the real module by
-full System32 path exactly once, caches every target, makes a single release store and posts the
+full System32 path exactly once, attempts every target, verifies the required table, makes a single
+release store and posts the
 ordinary `WM_DEVICECHANGE` rediscovery notification so Steam re-enumerates. A failed initialization
 is cached and stays blocked; no Steam call can retry it. This is the startup property that makes
 ValvePlug safe, kept while adding dynamic blocking.
@@ -241,7 +242,7 @@ taught:
 | State | Leases | Hook behavior | Next transition |
 | --- | ---: | --- | --- |
 | Not mapped | — | Steam started without the proxy, or it is not deployed | Redeploy and cold-start Steam; a default client reports `PayloadUnavailable` |
-| Bootstrapping | — | Proxy exports return their disconnected fallback | Worker caches the forwarding table and opens the pipe |
+| Bootstrapping | — | Proxy exports return their disconnected fallback | Worker caches the required forwarding targets and opens the pipe |
 | Resident idle, no hooks | 0 | Forwarders pass through; no detour installed | First `AcquireLease` installs the hooks |
 | Blocking | ≥1 | HID/XInput denied | More clients increment |
 | Final release | 1 → 0 | Pass-through is immediate | Payload requests rediscovery |

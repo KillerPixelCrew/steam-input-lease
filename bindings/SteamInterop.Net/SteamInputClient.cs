@@ -108,6 +108,9 @@ public sealed class SteamInputClient : IDisposable
     /// <remarks>
     /// The root process starts suspended, is assigned to a Windows job object,
     /// and is then resumed. Release is attempted even when launch/wait fails.
+    /// The child environment omits Steam's <c>SDL_GAMECONTROLLER_IGNORE_DEVICES</c>
+    /// exclusion so SDL can see the leased controllers. Other variables and the
+    /// caller's environment are preserved.
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="arguments"/> is null.</exception>
     /// <exception cref="ArgumentException">No executable was supplied.</exception>

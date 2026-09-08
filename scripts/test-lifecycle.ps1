@@ -93,6 +93,26 @@ try {
         throw "Wrapper returned $LASTEXITCODE; expected child exit code 23"
     }
 
+    $previousSdlExclusion = $env:SDL_GAMECONTROLLER_IGNORE_DEVICES
+    $previousSteamAppId = $env:SteamAppId
+    try {
+        $env:SDL_GAMECONTROLLER_IGNORE_DEVICES = '0x28de/0x1205'
+        $env:SteamAppId = '1234'
+        & $launcher --target-name steam-input-test-target.exe --payload $payload -- `
+            "$env:SystemRoot\System32\cmd.exe" /d /c `
+            'if defined SDL_GAMECONTROLLER_IGNORE_DEVICES (exit /b 41) else if "%SteamAppId%"=="1234" (exit /b 0) else (exit /b 42)'
+        if ($LASTEXITCODE -ne 0) {
+            throw "Wrapped child did not receive the expected controller environment: $LASTEXITCODE"
+        }
+        if ($env:SDL_GAMECONTROLLER_IGNORE_DEVICES -ne '0x28de/0x1205') {
+            throw 'Wrapped launch modified the caller controller environment'
+        }
+    }
+    finally {
+        $env:SDL_GAMECONTROLLER_IGNORE_DEVICES = $previousSdlExclusion
+        $env:SteamAppId = $previousSteamAppId
+    }
+
     # The root exits immediately after spawning a delayed descendant. A wrapper
     # that waits only for the root returns before this marker exists; a real job
     # tree wait returns only after the descendant has written it and exited.

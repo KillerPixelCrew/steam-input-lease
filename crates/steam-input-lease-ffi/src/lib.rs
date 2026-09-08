@@ -456,6 +456,8 @@ pub unsafe extern "C" fn sil_client_check_recovery(client: *mut SilClient) -> i3
 ///
 /// The call is synchronous and waits for the launched Windows process tree and
 /// final release handshake before returning.
+/// The child environment omits `SDL_GAMECONTROLLER_IGNORE_DEVICES`; other entries
+/// and the caller's environment are preserved.
 ///
 /// `release` is optional: pass null to ignore the final handshake. When it is
 /// supplied and the handshake failed, `recovery` is [`SIL_RECOVERY_UNAVAILABLE`]

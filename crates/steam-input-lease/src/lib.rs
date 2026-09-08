@@ -59,6 +59,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
     Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
+use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -432,6 +433,9 @@ impl Client {
     ///
     /// The command is started suspended, assigned to a Windows job object, and
     /// then resumed so quickly spawned descendants are included in the wait.
+    /// Its environment omits `SDL_GAMECONTROLLER_IGNORE_DEVICES`, which Steam
+    /// sets to hide the controllers this lease makes directly available.
+    /// The caller's environment and other launch variables are unchanged.
     /// Release is attempted even when process creation or waiting fails.
     ///
     /// Returns the root process exit code and the final release handshake.
@@ -1512,7 +1516,44 @@ unsafe fn abort_unstarted_process(process: HANDLE, cause: Error) -> Error {
     }
 }
 
+fn leased_environment_block(environment: &[u16]) -> Vec<u16> {
+    let mut result = Vec::with_capacity(environment.len());
+    for entry in environment.split(|unit| *unit == 0).take_while(|entry| !entry.is_empty()) {
+        let name_end = entry.iter().position(|unit| *unit == b'=' as u16).unwrap_or(entry.len());
+        if String::from_utf16_lossy(&entry[..name_end])
+            .eq_ignore_ascii_case("SDL_GAMECONTROLLER_IGNORE_DEVICES")
+        {
+            continue;
+        }
+        result.extend_from_slice(entry);
+        result.push(0);
+    }
+    // An empty environment still requires two terminating NULs.
+    if result.is_empty() {
+        result.push(0);
+    }
+    result.push(0);
+    result
+}
+
+fn leased_environment() -> Result<Vec<u16>> {
+    unsafe {
+        let environment = GetEnvironmentStringsW();
+        if environment.is_null() {
+            return Err(Error::windows("could not snapshot the wrapped-process environment"));
+        }
+        let mut length = 0;
+        while *environment.add(length) != 0 || *environment.add(length + 1) != 0 {
+            length += 1;
+        }
+        let result = leased_environment_block(std::slice::from_raw_parts(environment, length + 2));
+        FreeEnvironmentStringsW(environment);
+        Ok(result)
+    }
+}
+
 fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
+    let environment = leased_environment()?;
     let mut command_line = Vec::new();
     for argument in arguments {
         if !command_line.is_empty() {
@@ -1533,7 +1574,7 @@ fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
             null(),
             FALSE,
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            null(),
+            environment.as_ptr().cast(),
             null(),
             &startup,
             &mut process,
@@ -1623,6 +1664,22 @@ fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leased_child_removes_only_the_sdl_exclusion_and_preserves_the_source() {
+        let source = "=C:=C:\\Games\0EMPTY=\0PATH=C:\\Games;C:\\Windows\0sdl_gamecontroller_ignore_devices=0x28de/0x1205\0SDL_GAMECONTROLLER_IGNORE_DEVICES=@filter.txt\0SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x054c/0x09cc\0SteamAppId=1234\0SteamOverlayGameId=1234\0UNICODE=雪\0\0";
+        let original: Vec<u16> = source.encode_utf16().collect();
+        let expected = "=C:=C:\\Games\0EMPTY=\0PATH=C:\\Games;C:\\Windows\0SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x054c/0x09cc\0SteamAppId=1234\0SteamOverlayGameId=1234\0UNICODE=雪\0\0";
+        assert_eq!(leased_environment_block(&original), expected.encode_utf16().collect::<Vec<_>>());
+        assert_eq!(original, source.encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn leased_child_environment_keeps_double_nul_termination_when_empty() {
+        assert_eq!(leased_environment_block(&[0, 0]), vec![0, 0]);
+        let only_exclusion: Vec<u16> = "SDL_GAMECONTROLLER_IGNORE_DEVICES=0x28de/0x1205\0\0".encode_utf16().collect();
+        assert_eq!(leased_environment_block(&only_exclusion), vec![0, 0]);
+    }
 
     #[test]
     fn windows_command_line_quoting_matches_command_line_to_argv_rules() {

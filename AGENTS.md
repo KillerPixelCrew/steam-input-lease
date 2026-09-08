@@ -96,6 +96,10 @@ pass-through immediately.
 Recovery is reported separately from lease release. A recovery failure must not make an already
 released lease appear held or failed.
 
+Wrapped launches remove `SDL_GAMECONTROLLER_IGNORE_DEVICES` from the child's environment only
+after acquiring a lease. Preserve all other environment entries, the caller's environment, command
+arguments, working directory, and job ownership. A lease failure must not change an unleased launch.
+
 The default client connects only to a resident payload. Injection remains explicit opt-in and must
 never become an implicit fallback. Ordinary builds and tests must not inject into real Steam.
 

@@ -317,6 +317,13 @@ accounting fails only after resume, the library terminates the untrackable job a
 `ERROR_PROCESS_ABORTED` as the process result. It does not return a pre-start error that could make
 a fail-open caller launch the same target twice.
 
+The wrapped child receives a copy of the caller's environment without
+`SDL_GAMECONTROLLER_IGNORE_DEVICES`. Steam sets that exclusion for games that use Steam Input;
+retaining it while a lease blocks Steam would also hide the direct controller from SDL. Only the
+child's copy is filtered, with a case-insensitive variable-name match. Steam app/overlay variables,
+other SDL hints, working directory and arguments are preserved. A caller that acquires a lease and
+launches its own child must apply the same exclusion removal after acquisition succeeds.
+
 `Lease::release` is the observable path: it sends `ReleaseLease` and waits for the response.
 Dropping a `Lease` closes the pipe and is crash-safe, but reports neither status nor recovery
 outcome. An `Err` from release means the release handshake failed. Recovery is reported separately
@@ -569,6 +576,9 @@ still answers a non-injecting `--status` query. Steps 1 and 3 assert only that t
 the blocked error, not a specific code. Loaded under its own file name the payload serves no
 forwarders, so this test covers the hooks and the lease protocol, not the proxy bootstrap; that
 half is verified by the export-map check and against a live Steam.
+
+The wrapped-child check also supplies an SDL controller exclusion and verifies that the child
+loses it while retaining `SteamAppId`, with the caller's environment unchanged.
 
 ### Package
 

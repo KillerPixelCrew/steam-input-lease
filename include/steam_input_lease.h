@@ -201,6 +201,8 @@ SIL_API int32_t sil_client_check_recovery(SilClient* client);
 /**
  * Runs an executable/argument vector under a lease, waits for its Windows job
  * process tree, releases the lease, then writes the root process exit code.
+ * The child environment omits SDL_GAMECONTROLLER_IGNORE_DEVICES so SDL can
+ * enumerate leased controllers. All other entries and the caller are unchanged.
  *
  * A returned SIL_ERROR means the target NEVER STARTED, so the caller may
  * safely launch it itself. A release handshake that fails after the run has

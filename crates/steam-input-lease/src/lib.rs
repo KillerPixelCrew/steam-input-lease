@@ -429,6 +429,22 @@ impl Client {
         })
     }
 
+    /// Temporarily lets Steam read controllers while preserving existing block leases.
+    ///
+    /// The claim overrides all clients' leases until explicitly released or dropped.
+    /// Callers must neutralize their input capture before acquiring it and wait for
+    /// controller rediscovery before forwarding a Steam-native action.
+    ///
+    /// # Errors
+    /// Returns a connection or protocol error if the payload cannot grant the claim.
+    /// Older payloads reject the new command without changing ownership.
+    pub fn acquire_pass_through(&self) -> Result<PassThrough> {
+        let process_id = self.process_id()?;
+        let pipe = self.connect(process_id)?;
+        let response = exchange(pipe.raw(), Command::AcquirePassThrough)?;
+        Ok(PassThrough { pipe, acquired_status: response.into() })
+    }
+
     /// Runs a command while a lease is held and waits for its process tree.
     ///
     /// The command is started suspended, assigned to a Windows job object, and
@@ -632,6 +648,32 @@ impl Lease {
             status: response.into(),
             recovery,
         })
+    }
+}
+
+/// A pipe-scoped override that lets Steam read controllers without ending block leases.
+/// Dropping the claim restores blocking when this was the final pass-through owner
+/// and at least one block lease remains. A caller crash has the same effect.
+#[derive(Debug)]
+pub struct PassThrough {
+    pipe: OwnedHandle,
+    acquired_status: Status,
+}
+
+impl PassThrough {
+    /// Returns the payload status observed when pass-through was granted.
+    #[must_use]
+    pub const fn status(&self) -> Status {
+        self.acquired_status
+    }
+
+    /// Ends this override and returns the remaining lease status.
+    ///
+    /// # Errors
+    /// A pipe or protocol error means acknowledgement failed. The connection is
+    /// closed regardless; do not retry an uncertain ownership write.
+    pub fn release(self) -> Result<Status> {
+        exchange(self.pipe.raw(), Command::ReleasePassThrough).map(Status::from)
     }
 }
 

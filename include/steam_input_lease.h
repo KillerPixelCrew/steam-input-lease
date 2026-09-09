@@ -34,11 +34,16 @@ extern "C" {
 
 /** Payload performs guarded internal recovery after the final lease. */
 #define SIL_CAPABILITY_INTERNAL_RECOVERY (1u << 0)
+/** Payload accepts pipe-scoped pass-through claims. */
+#define SIL_CAPABILITY_PASS_THROUGH (1u << 1)
+/** Status bit: an active claim currently overrides block leases. */
+#define SIL_STATE_PASS_THROUGH_ACTIVE (1u << 2)
 
 /** Opaque reusable client configuration handle. */
 typedef struct SilClient SilClient;
 /** Opaque uniquely owned active lease handle. */
 typedef struct SilLease SilLease;
+typedef struct SilPassThrough SilPassThrough;
 
 /** Options passed to sil_client_create(). */
 typedef struct SilClientOptions {
@@ -186,6 +191,17 @@ SIL_API int32_t sil_lease_release(
  * is allowed. No synchronous recovery status is returned.
  */
 SIL_API void sil_lease_destroy(SilLease* lease);
+
+/** Grants a pipe-scoped override of all block leases. On failure *claim is NULL.
+ * Existing block leases remain owned. Release/destroy the claim exactly once. */
+SIL_API int32_t sil_client_acquire_pass_through(
+    SilClient* client, SilPassThrough** claim, SilStatus* status);
+
+/** Consumes the claim even on error. The final claim restores blocking if leases remain. */
+SIL_API int32_t sil_pass_through_release(SilPassThrough* claim, SilStatus* status);
+
+/** Crash-safe claim closure; NULL is allowed. */
+SIL_API void sil_pass_through_destroy(SilPassThrough* claim);
 
 /** Runs guarded two-pass Steam discovery without changing the lease count. */
 SIL_API int32_t sil_client_rescan(

@@ -83,6 +83,28 @@ try {
         throw "Rust payload did not gate the fake HID path while leased"
     }
 
+    $previousSilTestTarget = $env:SIL_TEST_TARGET
+    $previousSilTestPort = $env:SIL_TEST_PORT
+    try {
+        $env:SIL_TEST_TARGET = $target
+        $env:SIL_TEST_PORT = [string]$port
+        cargo test -p steam-input-lease --test pass_through --target $rustTarget `
+            --manifest-path (Join-Path $workspace 'Cargo.toml') -- --ignored
+        if ($LASTEXITCODE -ne 0) {
+            throw "Pass-through ownership lifecycle failed"
+        }
+        $managedProject = Join-Path $workspace 'samples/SteamInterop.CSharpExample/SteamInterop.CSharpExample.csproj'
+        dotnet build $managedProject --configuration Release --warnaserror
+        if ($LASTEXITCODE -ne 0) { throw "Managed lifecycle sample build failed" }
+        $managedOutput = Join-Path $workspace 'samples/SteamInterop.CSharpExample/bin/Release/net8.0-windows10.0.17763.0'
+        Copy-Item -LiteralPath (Join-Path $output 'steam_input_lease_ffi.dll') -Destination $managedOutput -Force
+        dotnet (Join-Path $managedOutput 'SteamInterop.CSharpExample.dll') --verify-pass-through
+        if ($LASTEXITCODE -ne 0) { throw "Managed pass-through lifecycle failed" }
+    } finally {
+        $env:SIL_TEST_TARGET = $previousSilTestTarget
+        $env:SIL_TEST_PORT = $previousSilTestPort
+    }
+
     & $target --probe-client $port --expect-open
     if ($LASTEXITCODE -ne 0) {
         throw "Fake HID path remained blocked after releasing the lease"

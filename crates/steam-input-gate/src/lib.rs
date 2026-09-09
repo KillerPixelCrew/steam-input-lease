@@ -32,8 +32,8 @@ use minhook_sys::{
     MH_ApplyQueued, MH_CreateHook, MH_Initialize, MH_OK, MH_QueueEnableHook, MH_Uninitialize,
 };
 use steam_input_lease_core::{
-    CAPABILITY_INTERNAL_RECOVERY, Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response,
-    ResultCode,
+    CAPABILITY_INTERNAL_RECOVERY, CAPABILITY_PASS_THROUGH, STATE_PASS_THROUGH_ACTIVE,
+    Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response, ResultCode,
 };
 use steam_input_recovery::{
     RecoveryLayout, SchedulerSample, find_vtable_pairs, resolve_recovery_layout,
@@ -289,6 +289,9 @@ static XINPUT_GET_CAPABILITIES_EX: [AtomicPtr<c_void>; 5] =
 
 // Process-global observable state returned through every protocol response.
 static LEASE_COUNT: AtomicI32 = AtomicI32::new(0);
+static PASS_THROUGH_COUNT: AtomicI32 = AtomicI32::new(0);
+// Only pipe workers take this lock. Detours read the counters without blocking.
+static OWNERSHIP_TRANSITION: Mutex<()> = Mutex::new(());
 static HID_HANDLE_COUNT: AtomicI32 = AtomicI32::new(0);
 static LAST_REVOKED_HANDLE_COUNT: AtomicI32 = AtomicI32::new(0);
 static RECOVERY_LAYOUT: OnceLock<RuntimeRecoveryLayout> = OnceLock::new();
@@ -379,6 +382,7 @@ static HANDLE_CLOSE_BARRIER: RwLock<()> = RwLock::new(());
 
 fn blocking() -> bool {
     LEASE_COUNT.load(Ordering::Acquire) > 0
+        && PASS_THROUGH_COUNT.load(Ordering::Acquire) == 0
 }
 
 unsafe fn load_function<T: Copy>(slot: &AtomicPtr<c_void>) -> T {
@@ -1766,11 +1770,14 @@ fn resolve_discovery_deadline(ignore_budget: bool) -> Option<usize> {
 }
 
 fn payload_capabilities() -> u16 {
-    if resolve_discovery_deadline(false).is_some() {
+    let recovery = if resolve_discovery_deadline(false).is_some() {
         CAPABILITY_INTERNAL_RECOVERY
     } else {
         0
-    }
+    };
+    recovery | CAPABILITY_PASS_THROUGH | if PASS_THROUGH_COUNT.load(Ordering::Acquire) > 0 {
+        STATE_PASS_THROUGH_ACTIVE
+    } else { 0 }
 }
 
 fn request_internal_discovery(ignore_budget: bool) -> bool {
@@ -2005,15 +2012,17 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
         && request.version == PROTOCOL_VERSION;
 
     let mut lease = false;
+    let mut pass_through = false;
     let result = if !valid {
         ResultCode::InvalidRequest
     } else if request.command == Command::AcquireLease as u16 {
         if !ensure_hooks_installed() {
             ResultCode::HookInstallFailed
         } else {
+            let _transition = OWNERSHIP_TRANSITION.lock().unwrap_or_else(|error| error.into_inner());
             let leases = LEASE_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
             lease = true;
-            if leases == 1 {
+            if leases == 1 && blocking() {
                 // A fresh acquire is the natural retry point for the bounded caches.
                 HID_THREAD_ATTEMPTS.store(0, Ordering::Release);
                 RECOVERY_LAYOUT_ATTEMPTS.store(0, Ordering::Release);
@@ -2021,6 +2030,15 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
             }
             ResultCode::Ok
         }
+    } else if request.command == Command::AcquirePassThrough as u16 {
+        let _transition = OWNERSHIP_TRANSITION.lock().unwrap_or_else(|error| error.into_inner());
+        let was_blocking = blocking();
+        PASS_THROUGH_COUNT.fetch_add(1, Ordering::AcqRel);
+        pass_through = true;
+        if was_blocking {
+            notify_controller_rescan();
+        }
+        ResultCode::Ok
     } else if request.command == Command::QueryStatus as u16 {
         ResultCode::Ok
     } else {
@@ -2038,7 +2056,7 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
         )
     };
 
-    if lease {
+    if lease || pass_through {
         // This blocking read is intentional: the pipe's lifetime is the lease.
         // Explicit Release gives a response; EOF still decrements the count.
         let mut release: Request = unsafe { zeroed() };
@@ -2054,11 +2072,27 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
             && transferred == size_of::<Request>() as u32
             && release.magic == PROTOCOL_MAGIC
             && release.version == PROTOCOL_VERSION
-            && release.command == Command::ReleaseLease as u16;
+            && release.command == if pass_through {
+                Command::ReleasePassThrough as u16
+            } else {
+                Command::ReleaseLease as u16
+            };
 
-        let remaining = LEASE_COUNT.fetch_sub(1, Ordering::AcqRel) - 1;
-        if remaining == 0 {
-            notify_controller_rescan();
+        {
+            let _transition = OWNERSHIP_TRANSITION.lock().unwrap_or_else(|error| error.into_inner());
+            let was_blocking = blocking();
+            if pass_through {
+                PASS_THROUGH_COUNT.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                LEASE_COUNT.fetch_sub(1, Ordering::AcqRel);
+            }
+            if !was_blocking && blocking() {
+                HID_THREAD_ATTEMPTS.store(0, Ordering::Release);
+                RECOVERY_LAYOUT_ATTEMPTS.store(0, Ordering::Release);
+                discover_and_revoke_hid_handles();
+            } else if was_blocking && !blocking() {
+                notify_controller_rescan();
+            }
         }
         if explicit {
             let released = response(ResultCode::Ok);

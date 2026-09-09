@@ -93,6 +93,11 @@ A lease is owned by one named-pipe connection. Explicit release and connection E
 that ownership exactly once; concurrent clients are reference-counted, and final release restores
 pass-through immediately.
 
+Temporary pass-through claims use separate pipe ownership and override blocking without consuming
+any block lease. The final claim's release or EOF restores blocking only when block leases remain.
+Serialize ownership transitions on pipe workers; detours keep their allocation-free atomic reads.
+Keep support and active-override status bits distinct from the owned block-lease count.
+
 Recovery is reported separately from lease release. A recovery failure must not make an already
 released lease appear held or failed.
 

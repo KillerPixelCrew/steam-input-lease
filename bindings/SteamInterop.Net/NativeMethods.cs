@@ -88,6 +88,15 @@ internal static class NativeMethods
     internal static extern void sil_lease_destroy(nint lease);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int sil_client_acquire_pass_through(ClientHandle client, out nint claim, out Status status);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int sil_pass_through_release(nint claim, out Status status);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void sil_pass_through_destroy(nint claim);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int sil_client_rescan(ClientHandle client, out RescanResult result);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]

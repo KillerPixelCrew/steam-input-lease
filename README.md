@@ -325,6 +325,24 @@ other SDL hints, working directory and arguments are preserved. A caller that ac
 launches its own child must apply the same exclusion removal after acquisition succeeds.
 
 `Lease::release` is the observable path: it sends `ReleaseLease` and waits for the response.
+
+`Client::acquire_pass_through` temporarily overrides all block leases without consuming them.
+The C API exposes `sil_client_acquire_pass_through`, `sil_pass_through_release`, and
+`sil_pass_through_destroy`; .NET exposes `SteamInputClient.AcquirePassThrough()` and the disposable
+`SteamInputPassThrough` claim. Each claim owns a separate pipe. The final claim's release or EOF
+restores blocking only if block leases remain. Overlapping claims keep pass-through active, and
+game wrappers may acquire or release their own leases during a handoff without losing ownership.
+Callers must stop conflicting input capture and manage physical visibility before forwarding a
+Steam action. This primitive does not alter HidHide or detect Steam surface closure.
+
+Wire commands 4 and 5 add acquire/release pass-through without changing existing layouts or command
+values. Status bit 1 advertises support and bit 2 reports an active override; bit 0 retains its
+internal-recovery meaning. Lease count remains the number of owned block leases, even while
+pass-through overrides them. Older gates reject the new acquire command without changing state.
+Controller rediscovery remains asynchronous, so a granted claim is not proof that Steam has
+already enumerated the controller. These additive C exports preserve ABI version 3 and require
+the matching client DLL when called.
+
 Dropping a `Lease` closes the pipe and is crash-safe, but reports neither status nor recovery
 outcome. An `Err` from release means the release handshake failed. Recovery is reported separately
 in `ReleaseOutcome::recovery`, because closing the pipe has already lifted blocking by the time

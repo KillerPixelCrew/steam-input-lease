@@ -13,6 +13,10 @@ pub const PROTOCOL_MAGIC: u32 = 0x5349_4754; // "SIGT"
 pub const PROTOCOL_VERSION: u16 = 1;
 /// Response capability indicating guarded internal Steam controller recovery.
 pub const CAPABILITY_INTERNAL_RECOVERY: u16 = 1 << 0;
+/// Payload supports pipe-scoped pass-through claims without dropping block leases.
+pub const CAPABILITY_PASS_THROUGH: u16 = 1 << 1;
+/// Status indicates that at least one pass-through claim currently overrides blocking.
+pub const STATE_PASS_THROUGH_ACTIVE: u16 = 1 << 2;
 
 /// Commands accepted by the injected payload's named-pipe server.
 #[repr(u16)]
@@ -25,6 +29,10 @@ pub enum Command {
     QueryStatus = 2,
     /// Explicitly release a previously acquired lease connection.
     ReleaseLease = 3,
+    /// Temporarily override all block leases until this connection closes or releases.
+    AcquirePassThrough = 4,
+    /// End this connection's pass-through claim, preserving all block lease owners.
+    ReleasePassThrough = 5,
 }
 
 /// Result values returned in [`Response::result`].

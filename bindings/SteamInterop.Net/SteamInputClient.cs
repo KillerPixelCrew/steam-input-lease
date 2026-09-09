@@ -82,6 +82,16 @@ public sealed class SteamInputClient : IDisposable
         return new SteamInputBlockLease(new LeaseHandle(lease), SteamInputStatus.FromNative(status));
     }
 
+    /// <summary>Temporarily lets Steam read controllers while preserving all block leases.</summary>
+    /// <returns>A uniquely owned claim; disposing it restores remaining block leases.</returns>
+    /// <exception cref="SteamInputLeaseException">The payload could not grant pass-through.</exception>
+    public SteamInputPassThrough AcquirePassThrough()
+    {
+        NativeMethods.ThrowIfFailed(
+            NativeMethods.sil_client_acquire_pass_through(_handle, out nint claim, out var status));
+        return new SteamInputPassThrough(new PassThroughHandle(claim), SteamInputStatus.FromNative(status));
+    }
+
     /// <summary>Runs the guarded two-pass Steam controller discovery.</summary>
     /// <returns>Steam's scan-counter observations around both requests.</returns>
     /// <remarks>This does not change the active lease count.</remarks>

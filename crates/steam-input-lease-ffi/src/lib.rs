@@ -193,6 +193,60 @@ pub struct SilClient(Client);
 /// Opaque C handle owning one active Rust [`Lease`].
 pub struct SilLease(Option<Lease>);
 
+/// Opaque, uniquely owned temporary pass-through claim.
+pub struct SilPassThrough(steam_input_lease::PassThrough);
+
+/// Grants temporary pass-through without consuming existing block leases.
+///
+/// # Safety
+/// `client` must be live; `claim` and `status` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sil_client_acquire_pass_through(
+    client: *mut SilClient,
+    claim: *mut *mut SilPassThrough,
+    status: *mut SilStatus,
+) -> i32 {
+    ffi_call(|| {
+        if claim.is_null() { return Err("claim output pointer was null".into()); }
+        unsafe { *claim = null_mut() };
+        if status.is_null() { return Err("status output pointer was null".into()); }
+        let value = unsafe { client_ref(client)? }.acquire_pass_through()
+            .map_err(|error| error.to_string())?;
+        unsafe {
+            *status = value.status().into();
+            *claim = Box::into_raw(Box::new(SilPassThrough(value)));
+        }
+        Ok(())
+    })
+}
+
+/// Consumes the claim, even if the acknowledgement fails.
+///
+/// # Safety
+/// `claim` must be live and uniquely owned; `status` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sil_pass_through_release(
+    claim: *mut SilPassThrough, status: *mut SilStatus,
+) -> i32 {
+    ffi_call(|| {
+        if claim.is_null() { return Err("claim pointer was null".into()); }
+        let claim = unsafe { Box::from_raw(claim) };
+        if status.is_null() { return Err("status output pointer was null".into()); }
+        let value = claim.0.release().map_err(|error| error.to_string())?;
+        unsafe { *status = value.into() };
+        Ok(())
+    })
+}
+
+/// Closes the claim's pipe for crash-safe restoration of remaining block leases.
+///
+/// # Safety
+/// `claim` must be null or live and uniquely owned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sil_pass_through_destroy(claim: *mut SilPassThrough) {
+    if !claim.is_null() { drop(unsafe { Box::from_raw(claim) }); }
+}
+
 fn set_last_error(message: impl AsRef<str>) {
     let sanitized = message.as_ref().replace('\0', " ");
     LAST_ERROR.with(|slot| {

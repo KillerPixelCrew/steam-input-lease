@@ -49,6 +49,12 @@ public readonly record struct SteamInputStatus(
     /// <summary>Whether the payload supports guarded internal Steam recovery.</summary>
     public bool SupportsInternalRecovery => (Capabilities & 1) != 0;
 
+    /// <summary>Gets whether the payload supports temporary pass-through claims.</summary>
+    public bool SupportsPassThrough => (Capabilities & 2) != 0;
+
+    /// <summary>Gets whether a pass-through claim currently overrides block leases.</summary>
+    public bool IsPassThroughActive => (Capabilities & 4) != 0;
+
     internal static SteamInputStatus FromNative(NativeMethods.Status value) => new(
         value.Capabilities,
         value.LeaseCount,

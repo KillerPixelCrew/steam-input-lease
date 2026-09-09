@@ -96,7 +96,10 @@ impl StartupTrace {
                 if create_dir_all(parent).is_err() {
                     return None;
                 }
-                prune_old_traces(parent, TRACE_RETENTION);
+                // The new file does not exist yet, so leave room for it. This
+                // keeps the post-open total at TRACE_RETENTION rather than
+                // retaining eight old files plus the one being created.
+                prune_old_traces(parent, TRACE_RETENTION.saturating_sub(1));
             }
             OpenOptions::new()
                 .create(true)

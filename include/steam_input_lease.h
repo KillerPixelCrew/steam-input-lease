@@ -34,11 +34,16 @@ extern "C" {
 
 /** Payload performs guarded internal recovery after the final lease. */
 #define SIL_CAPABILITY_INTERNAL_RECOVERY (1u << 0)
+/** Payload accepts pipe-scoped pass-through claims. */
+#define SIL_CAPABILITY_PASS_THROUGH (1u << 1)
+/** Status bit: an active claim currently overrides block leases. */
+#define SIL_STATE_PASS_THROUGH_ACTIVE (1u << 2)
 
 /** Opaque reusable client configuration handle. */
 typedef struct SilClient SilClient;
 /** Opaque uniquely owned active lease handle. */
 typedef struct SilLease SilLease;
+typedef struct SilPassThrough SilPassThrough;
 
 /** Options passed to sil_client_create(). */
 typedef struct SilClientOptions {
@@ -47,7 +52,7 @@ typedef struct SilClientOptions {
     /** Payload DLL path, or NULL to use the executable-directory default. */
     /* Consulted ONLY when allow_injection is non-zero. */
     const uint16_t* payload_path;
-    /** Pipe startup timeout in milliseconds, or zero for the default. */
+    /** Resident/post-injection pipe wait in milliseconds, or zero for 10 s. */
     uint32_t connect_timeout_ms;
     /*
      * Non-zero to let this client inject the payload when no resident one
@@ -123,14 +128,15 @@ typedef struct SilReleaseOutcome {
  * of a bare SilStatus, so a recovery failure no longer presents a released
  * lease as a failed one.
  *
- * Version 4 added allow_injection to SilClientOptions and made proxy delivery
- * the default: the payload is normally a search-order DLL Steam loads from its
- * own directory, so payload_path and connect_timeout_ms only govern the opt-in
- * injection path. A client left at the defaults can never write into Steam.
- *
  * Version 3 added the release output to sil_client_run_wrapped(), which
  * previously discarded the final handshake — a wrapped game could leave Steam
  * without controller recovery and nothing could report it.
+ *
+ * Version 4 added allow_injection to SilClientOptions and made proxy delivery
+ * the default: the payload is normally a search-order DLL Steam loads from its
+ * own directory, so payload_path governs only the opt-in injection path.
+ * connect_timeout_ms bounds both the resident-payload wait and the wait after
+ * opt-in injection. A client left at the defaults can never write into Steam.
  */
 SIL_API uint32_t sil_abi_version(void);
 
@@ -186,6 +192,17 @@ SIL_API int32_t sil_lease_release(
  */
 SIL_API void sil_lease_destroy(SilLease* lease);
 
+/** Grants a pipe-scoped override of all block leases. On failure *claim is NULL.
+ * Existing block leases remain owned. Release/destroy the claim exactly once. */
+SIL_API int32_t sil_client_acquire_pass_through(
+    SilClient* client, SilPassThrough** claim, SilStatus* status);
+
+/** Consumes the claim even on error. The final claim restores blocking if leases remain. */
+SIL_API int32_t sil_pass_through_release(SilPassThrough* claim, SilStatus* status);
+
+/** Crash-safe claim closure; NULL is allowed. */
+SIL_API void sil_pass_through_destroy(SilPassThrough* claim);
+
 /** Runs guarded two-pass Steam discovery without changing the lease count. */
 SIL_API int32_t sil_client_rescan(
     SilClient* client,
@@ -200,6 +217,8 @@ SIL_API int32_t sil_client_check_recovery(SilClient* client);
 /**
  * Runs an executable/argument vector under a lease, waits for its Windows job
  * process tree, releases the lease, then writes the root process exit code.
+ * The child environment omits SDL_GAMECONTROLLER_IGNORE_DEVICES so SDL can
+ * enumerate leased controllers. All other entries and the caller are unchanged.
  *
  * A returned SIL_ERROR means the target NEVER STARTED, so the caller may
  * safely launch it itself. A release handshake that fails after the run has

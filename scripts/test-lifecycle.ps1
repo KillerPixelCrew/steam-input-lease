@@ -21,13 +21,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
+$rustTarget = 'x86_64-pc-windows-msvc'
 $output = Join-Path $workspace 'target'
 if ($Profile -eq 'release') {
-    $output = Join-Path $output 'release'
-    cargo build --workspace --release --manifest-path (Join-Path $workspace 'Cargo.toml')
+    $output = Join-Path $output "$rustTarget\release"
+    cargo build --workspace --release --target $rustTarget --manifest-path (Join-Path $workspace 'Cargo.toml')
 } else {
-    $output = Join-Path $output 'debug'
-    cargo build --workspace --manifest-path (Join-Path $workspace 'Cargo.toml')
+    $output = Join-Path $output "$rustTarget\debug"
+    cargo build --workspace --target $rustTarget --manifest-path (Join-Path $workspace 'Cargo.toml')
 }
 if ($LASTEXITCODE -ne 0) {
     throw "Cargo build failed with exit code $LASTEXITCODE"
@@ -82,6 +83,28 @@ try {
         throw "Rust payload did not gate the fake HID path while leased"
     }
 
+    $previousSilTestTarget = $env:SIL_TEST_TARGET
+    $previousSilTestPort = $env:SIL_TEST_PORT
+    try {
+        $env:SIL_TEST_TARGET = $target
+        $env:SIL_TEST_PORT = [string]$port
+        cargo test -p steam-input-lease --test pass_through --target $rustTarget `
+            --manifest-path (Join-Path $workspace 'Cargo.toml') -- --ignored
+        if ($LASTEXITCODE -ne 0) {
+            throw "Pass-through ownership lifecycle failed"
+        }
+        $managedProject = Join-Path $workspace 'samples/SteamInterop.CSharpExample/SteamInterop.CSharpExample.csproj'
+        dotnet build $managedProject --configuration Release --warnaserror
+        if ($LASTEXITCODE -ne 0) { throw "Managed lifecycle sample build failed" }
+        $managedOutput = Join-Path $workspace 'samples/SteamInterop.CSharpExample/bin/Release/net8.0-windows10.0.17763.0'
+        Copy-Item -LiteralPath (Join-Path $output 'steam_input_lease_ffi.dll') -Destination $managedOutput -Force
+        dotnet (Join-Path $managedOutput 'SteamInterop.CSharpExample.dll') --verify-pass-through
+        if ($LASTEXITCODE -ne 0) { throw "Managed pass-through lifecycle failed" }
+    } finally {
+        $env:SIL_TEST_TARGET = $previousSilTestTarget
+        $env:SIL_TEST_PORT = $previousSilTestPort
+    }
+
     & $target --probe-client $port --expect-open
     if ($LASTEXITCODE -ne 0) {
         throw "Fake HID path remained blocked after releasing the lease"
@@ -92,19 +115,58 @@ try {
         throw "Wrapper returned $LASTEXITCODE; expected child exit code 23"
     }
 
+    $previousSdlExclusion = $env:SDL_GAMECONTROLLER_IGNORE_DEVICES
+    $previousSteamAppId = $env:SteamAppId
+    try {
+        $env:SDL_GAMECONTROLLER_IGNORE_DEVICES = '0x28de/0x1205'
+        $env:SteamAppId = '1234'
+        & $launcher --target-name steam-input-test-target.exe --payload $payload -- `
+            "$env:SystemRoot\System32\cmd.exe" /d /c `
+            'if defined SDL_GAMECONTROLLER_IGNORE_DEVICES (exit /b 41) else if "%SteamAppId%"=="1234" (exit /b 0) else (exit /b 42)'
+        if ($LASTEXITCODE -ne 0) {
+            throw "Wrapped child did not receive the expected controller environment: $LASTEXITCODE"
+        }
+        if ($env:SDL_GAMECONTROLLER_IGNORE_DEVICES -ne '0x28de/0x1205') {
+            throw 'Wrapped launch modified the caller controller environment'
+        }
+    }
+    finally {
+        $env:SDL_GAMECONTROLLER_IGNORE_DEVICES = $previousSdlExclusion
+        $env:SteamAppId = $previousSteamAppId
+    }
+
+    # The root exits immediately after spawning a delayed descendant. A wrapper
+    # that waits only for the root returns before this marker exists; a real job
+    # tree wait returns only after the descendant has written it and exited.
+    $descendantMarker = Join-Path $resolvedTraceDirectory 'descendant-completed.txt'
+    & $launcher --target-name steam-input-test-target.exe --payload $payload -- `
+        $target --child-tree $descendantMarker
+    if ($LASTEXITCODE -ne 23) {
+        throw "Process-tree wrapper returned $LASTEXITCODE; expected root exit code 23"
+    }
+    if (-not (Test-Path -LiteralPath $descendantMarker -PathType Leaf)) {
+        throw "Wrapper returned before its delayed descendant completed"
+    }
+
     & $launcher --target-name steam-input-test-target.exe --status
     if ($LASTEXITCODE -ne 0) {
         throw "Payload status query returned $LASTEXITCODE"
     }
 
-    $trace = Get-ChildItem -LiteralPath $resolvedTraceDirectory `
-        -Filter 'steam-input-gate-*.log' | Select-Object -First 1
-    if ($null -eq $trace) {
-        throw "Injected payload did not produce its isolated startup trace"
-    }
-    $traceContent = Get-Content -LiteralPath $trace.FullName -Raw
-    if ($traceContent -notmatch 'control pipe listening') {
-        throw "Startup trace did not reach control-pipe readiness"
+    # The temp-directory override is deliberately compiled out of shipped
+    # release DLLs. Validate the isolated trace only for the debug payload;
+    # release still exercises the complete lease/job lifecycle above without
+    # reading or deleting the user's real %LOCALAPPDATA% trace.
+    if ($Profile -eq 'debug') {
+        $trace = Get-ChildItem -LiteralPath $resolvedTraceDirectory `
+            -Filter 'steam-input-gate-*.log' | Select-Object -First 1
+        if ($null -eq $trace) {
+            throw "Injected payload did not produce its isolated startup trace"
+        }
+        $traceContent = Get-Content -LiteralPath $trace.FullName -Raw
+        if ($traceContent -notmatch 'control pipe listening') {
+            throw "Startup trace did not reach control-pipe readiness"
+        }
     }
 } finally {
     if ($null -ne $targetProcess) {

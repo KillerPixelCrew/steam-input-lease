@@ -15,11 +15,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.94"
+description = "Crash-safe, dynamically scoped Steam Input controller leases for Windows"
+repository = "https://github.com/KillerPixelCrew/steam-input-lease"
+readme = "README.md"
 
 [workspace.dependencies]
-steam-input-lease-core = { path = "crates/steam-input-lease-core" }
-steam-input-recovery = { path = "crates/steam-input-recovery" }
-steam-input-lease = { path = "crates/steam-input-lease" }
+steam-input-lease-core = { version = "0.1.0", path = "crates/steam-input-lease-core" }
+steam-input-recovery = { version = "0.1.0", path = "crates/steam-input-recovery" }
+steam-input-lease = { version = "0.1.0", path = "crates/steam-input-lease" }
 windows-sys = "0.61.2"
 
 [profile.release]

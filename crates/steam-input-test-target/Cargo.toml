@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
+description.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "steam-input-test-target"
@@ -13,5 +16,6 @@ doc = false
 [dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
 ] }

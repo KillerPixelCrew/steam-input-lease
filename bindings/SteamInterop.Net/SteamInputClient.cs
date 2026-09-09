@@ -15,10 +15,21 @@ public sealed class SteamInputClient : IDisposable
     /// <summary>Creates a client with optional process and payload overrides.</summary>
     /// <param name="options">Options to use, or <see langword="null"/> for defaults.</param>
     /// <exception cref="SteamInputLeaseException">Native client creation failed.</exception>
+    /// <exception cref="NotSupportedException">The loaded native DLL has an incompatible ABI.</exception>
+    /// <exception cref="ArgumentException">An option contains an embedded NUL character.</exception>
     /// <exception cref="OverflowException">The timeout cannot be represented in milliseconds.</exception>
     public SteamInputClient(SteamInputClientOptions? options = null)
     {
+        NativeMethods.EnsureCompatibleAbi();
         options ??= new SteamInputClientOptions();
+        if (options.TargetName.Contains('\0'))
+        {
+            throw new ArgumentException("The target name cannot contain a NUL character.", nameof(options));
+        }
+        if (options.PayloadPath.Contains('\0'))
+        {
+            throw new ArgumentException("The payload path cannot contain a NUL character.", nameof(options));
+        }
         nint targetName = Marshal.StringToCoTaskMemUni(options.TargetName);
         nint payloadPath = Marshal.StringToCoTaskMemUni(options.PayloadPath);
         try
@@ -71,6 +82,16 @@ public sealed class SteamInputClient : IDisposable
         return new SteamInputBlockLease(new LeaseHandle(lease), SteamInputStatus.FromNative(status));
     }
 
+    /// <summary>Temporarily lets Steam read controllers while preserving all block leases.</summary>
+    /// <returns>A uniquely owned claim; disposing it restores remaining block leases.</returns>
+    /// <exception cref="SteamInputLeaseException">The payload could not grant pass-through.</exception>
+    public SteamInputPassThrough AcquirePassThrough()
+    {
+        NativeMethods.ThrowIfFailed(
+            NativeMethods.sil_client_acquire_pass_through(_handle, out nint claim, out var status));
+        return new SteamInputPassThrough(new PassThroughHandle(claim), SteamInputStatus.FromNative(status));
+    }
+
     /// <summary>Runs the guarded two-pass Steam controller discovery.</summary>
     /// <returns>Steam's scan-counter observations around both requests.</returns>
     /// <remarks>This does not change the active lease count.</remarks>
@@ -97,6 +118,9 @@ public sealed class SteamInputClient : IDisposable
     /// <remarks>
     /// The root process starts suspended, is assigned to a Windows job object,
     /// and is then resumed. Release is attempted even when launch/wait fails.
+    /// The child environment omits Steam's <c>SDL_GAMECONTROLLER_IGNORE_DEVICES</c>
+    /// exclusion so SDL can see the leased controllers. Other variables and the
+    /// caller's environment are preserved.
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="arguments"/> is null.</exception>
     /// <exception cref="ArgumentException">No executable was supplied.</exception>
@@ -107,6 +131,18 @@ public sealed class SteamInputClient : IDisposable
         if (arguments.Length == 0)
         {
             throw new ArgumentException("At least one command argument is required.", nameof(arguments));
+        }
+        for (int index = 0; index < arguments.Length; index++)
+        {
+            if (arguments[index] is null)
+            {
+                throw new ArgumentException($"Command argument {index} is null.", nameof(arguments));
+            }
+            if (arguments[index].Contains('\0'))
+            {
+                throw new ArgumentException(
+                    $"Command argument {index} contains a NUL character.", nameof(arguments));
+            }
         }
 
         nint pointerArray = Marshal.AllocCoTaskMem(arguments.Length * IntPtr.Size);

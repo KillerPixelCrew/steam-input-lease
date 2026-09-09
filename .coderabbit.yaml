@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+early_access: false
+tone_instructions: >-
+  Be direct, technical, and concise. Report only actionable defects introduced
+  by the pull request, and ground safety claims in changed code or repository
+  contracts.
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  sequence_diagrams: false
+  changed_files_summary: false
+  estimate_code_review_effort: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  in_progress_fortune: false
+  enable_prompt_for_ai_agents: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!target/**"
+    - "!artifacts/**"
+    - "!**/bin/**"
+    - "!**/obj/**"
+  path_instructions:
+    - path: "crates/steam-input-gate/**"
+      instructions: |
+        - Flag attach that returns FALSE, starts a worker before pinning,
+          or adds loader-lock work beyond documented trace/record/pin/startup.
+        - Flag bare-name proxy resolution, self-image acceptance, or forwarding
+          readiness before every required target is cached.
+        - Preserve build.rs exports, gaps 104/109, and required versus optional
+          resolution. Export changes need finished-DLL table inspection.
+        - Keep first-lease hook installation one-shot, failures pass-through,
+          detours bounded, and the pipe remote-rejecting with its DACL fallback.
+    - path: "crates/steam-input-recovery/**"
+      instructions: |
+        - Reject Steam version tables, fixed RVAs, hard-coded object offsets,
+          or writes after missing or ambiguous evidence.
+        - Structural analysis must be unique. A multi-candidate live-object
+          scan must elect exactly one progressing object before any write.
+        - Preserve SDL repair before Steam discovery and fail closed without a
+          destructive Steam state change.
+    - path: "crates/steam-input-lease/**"
+      instructions: |
+        - Flag loss of one-connection ownership, exact-once release on release
+          or EOF, process-global counting, or immediate final pass-through.
+        - Keep recovery status separate from release success.
+        - Keep the default client resident-only, injection explicit opt-in,
+          and target discovery in the caller's Windows session.
+    - path: "crates/steam-input-lease-core/**"
+      instructions: |
+        Treat layout, protocol magic, capabilities, pipe naming, and
+        PROTOCOL_VERSION as one host/gate wire contract. Flag unilateral
+        changes, implicit version coupling, truncation, or malformed-message
+        acceptance.
+    - path: "crates/steam-input-lease-ffi/**"
+      instructions: |
+        - By-value records retain promised C layout and fixed widths; pointer
+          options and opaque handles keep ownership, lifetime, and width clear.
+        - ABI changes update Rust exports, the header, managed binding and
+          ExpectedAbiVersion, README ABI material, layout tests, and consumers.
+    - path: "include/**"
+      instructions: |
+        Cross-check declarations, constants, ownership, layouts, and ABI
+        version against `crates/steam-input-lease-ffi` and
+        `bindings/SteamInterop.Net`. Flag drift or missing release/error rules.
+    - path: "bindings/SteamInterop.Net/**"
+      instructions: |
+        Preserve the ABI check before every other native operation, SafeHandle
+        ownership, blittable layouts, native error/recovery semantics, and
+        public XML docs. Cross-check Rust FFI, C header, README, and version.
+    - path: "scripts/**"
+      instructions: |
+        - Keep build and packaging automation non-Steam and x64-specific.
+        - Lifecycle injection may target only `steam-input-test-target.exe`,
+          never real Steam or a real controller.
+        - Do not treat it as proof of live recovery or as export-table checking.
+
+knowledge_base:
+  code_guidelines:
+    enabled: true

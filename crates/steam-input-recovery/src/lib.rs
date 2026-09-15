@@ -8,12 +8,14 @@
 //! locators to the class vtables, and semantically inspects virtual methods for
 //! the discovery scheduler's deadline/counter instruction sequence.
 //!
-//! This crate only analyzes caller-supplied snapshots, and contains no Win32
-//! calls of its own. [`resolve_recovery_layout`] derives the layout from an
-//! image snapshot and [`find_vtable_pairs`] matches that layout against a
-//! snapshot of live memory; enumerating regions, reading either process, and
-//! writing the result are kept in the host and payload crates, where the
-//! appropriate Win32 APIs and ownership rules are known.
+//! This crate only analyzes caller-supplied snapshots and readings, and contains
+//! no Win32 calls of its own. [`resolve_recovery_layout`] derives the layout
+//! from an image snapshot, [`find_vtable_pairs`] matches that layout against a
+//! snapshot of live memory, and [`elect_progressing_candidate`] times the
+//! live-object election over caller-supplied reads; enumerating regions,
+//! reading either process, and writing the result are kept in the host and
+//! payload crates, where the appropriate Win32 APIs and ownership rules are
+//! known.
 
 #![deny(missing_docs)]
 // clippy 1.98 added `chunks_exact_to_as_chunks`, which fires on the three 8-byte
@@ -30,6 +32,8 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use core::fmt;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
@@ -176,6 +180,67 @@ const PAGE_GUARD: u32 = 0x100;
 #[must_use]
 pub const fn memory_is_readable(state: u32, protect: u32) -> bool {
     state == MEM_COMMIT && protect & PAGE_GUARD == 0 && protect & PAGE_NOACCESS == 0
+}
+
+// How long the live-object election watches the scheduler fields, and how often
+// it looks. The nudge makes the running thread reschedule well inside this
+// budget. The timeout stays bounded because the payload runs the election on a
+// pipe worker: an election that never separates the candidates ends in the same
+// fail-closed answer it replaced.
+const LIVE_ELECTION_TIMEOUT: Duration = Duration::from_millis(1500);
+const LIVE_ELECTION_INTERVAL: Duration = Duration::from_millis(125);
+
+/// Outcome of [`elect_progressing_candidate`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Election {
+    /// Exactly one candidate moved. The value is its index in the sampled list.
+    Elected(usize),
+    /// A candidate could not be read, which abandons the election.
+    Unreadable,
+    /// The observation window closed without exactly one candidate moving.
+    Ambiguous {
+        /// The observation taken before the nudge.
+        before: Vec<SchedulerSample>,
+        /// The last observation inside the window, or `None` when the window
+        /// closed before a second observation was taken.
+        last: Option<Vec<SchedulerSample>>,
+    },
+}
+
+/// Watches a candidate list for the one object that keeps scheduling discovery.
+///
+/// `sample` reads every candidate's scheduler fields in a fixed order and
+/// returns `None` when any candidate cannot be read: an unreadable address must
+/// never be mistaken for one that merely stood still. `nudge` runs once, after
+/// the first observation, to give the live thread a reason to reschedule. The
+/// candidates are then re-sampled every 125 milliseconds for up to 1.5 seconds,
+/// and the first observation that [`select_progressing_candidate`] resolves
+/// elects its candidate.
+///
+/// Nothing here writes to the observed process. Only [`Election::Elected`]
+/// names a candidate, so every other outcome keeps the caller fail-closed.
+pub fn elect_progressing_candidate(
+    mut sample: impl FnMut() -> Option<Vec<SchedulerSample>>,
+    nudge: impl FnOnce(),
+) -> Election {
+    let Some(before) = sample() else {
+        return Election::Unreadable;
+    };
+    nudge();
+
+    let deadline = Instant::now() + LIVE_ELECTION_TIMEOUT;
+    let mut last = None;
+    while Instant::now() < deadline {
+        thread::sleep(LIVE_ELECTION_INTERVAL);
+        let Some(after) = sample() else {
+            return Election::Unreadable;
+        };
+        if let Some(index) = select_progressing_candidate(&before, &after) {
+            return Election::Elected(index);
+        }
+        last = Some(after);
+    }
+    Election::Ambiguous { before, last }
 }
 
 /// Finds the addresses in a memory snapshot that begin an object carrying both
@@ -926,6 +991,34 @@ mod tests {
         let before = [sample(f64::NAN, 1), sample(500.0, 1)];
         let after = [sample(f64::NAN, 1), sample(600.0, 1)];
         assert_eq!(select_progressing_candidate(&before, &after), Some(1));
+    }
+
+    #[test]
+    fn the_election_ends_at_the_first_observation_with_one_moving_candidate() {
+        let mut observations = [
+            vec![sample(1000.0, 7), sample(940.0, 5)],
+            vec![sample(1000.0, 7), sample(1200.0, 5)],
+        ]
+        .into_iter();
+        let mut nudged = false;
+        let outcome = elect_progressing_candidate(|| observations.next(), || nudged = true);
+        assert_eq!(outcome, Election::Elected(1));
+        assert!(nudged);
+    }
+
+    #[test]
+    fn an_unreadable_first_observation_abandons_the_election_before_the_nudge() {
+        let mut nudged = false;
+        let outcome = elect_progressing_candidate(|| None, || nudged = true);
+        assert_eq!(outcome, Election::Unreadable);
+        assert!(!nudged);
+    }
+
+    #[test]
+    fn a_candidate_that_becomes_unreadable_abandons_the_election() {
+        let mut observations = [vec![sample(1000.0, 7), sample(940.0, 5)]].into_iter();
+        let outcome = elect_progressing_candidate(|| observations.next(), || {});
+        assert_eq!(outcome, Election::Unreadable);
     }
 
     #[test]

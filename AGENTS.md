@@ -18,7 +18,8 @@ use this file as a substitute for documenting the public contract.
 ## Repository map
 
 - `crates/steam-input-lease-core`: fixed-width pipe protocol, capabilities, and pipe naming.
-- `crates/steam-input-recovery`: build-independent Steam RTTI/vtable/instruction analysis.
+- `crates/steam-input-recovery`: build-independent Steam RTTI/vtable/instruction analysis and
+  live-object election.
 - `crates/steam-input-lease`: client, lease lifetime, process wrapper, recovery, and opt-in
   injection.
 - `crates/steam-input-gate`: proxy exports, hook engine, pipe server, recovery, and startup trace.

@@ -36,8 +36,8 @@ use steam_input_lease_core::{
     Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response, ResultCode,
 };
 use steam_input_recovery::{
-    RecoveryLayout, SchedulerSample, find_vtable_pairs, memory_is_readable,
-    resolve_recovery_layout, select_progressing_candidate,
+    Election, RecoveryLayout, SchedulerSample, elect_progressing_candidate, find_vtable_pairs,
+    memory_is_readable, resolve_recovery_layout,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes};
 use windows_sys::Win32::Foundation::{
@@ -298,12 +298,6 @@ const RECOVERY_LAYOUT_MAX_ATTEMPTS: u32 = 4;
 static HID_THREAD_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static HID_THREAD_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 const HID_THREAD_MAX_ATTEMPTS: u32 = 3;
-
-// How long the live-object election watches the scheduler fields, and how often
-// it looks. Bounded because it runs on a pipe worker: an election that never
-// separates the candidates ends in the same "no address" answer it replaced.
-const LIVE_ELECTION_TIMEOUT: Duration = Duration::from_millis(1500);
-const LIVE_ELECTION_INTERVAL: Duration = Duration::from_millis(125);
 
 /// Deadline shared with the rescan timer thread, and the condvar used to re-arm
 /// it. `None` deadline means idle.
@@ -1718,18 +1712,15 @@ fn elect_running_hid_thread(
     runtime: &RuntimeRecoveryLayout,
     candidates: &[usize],
 ) -> Option<usize> {
-    let before = sample_candidates(runtime, candidates)?;
-    unsafe { EnumWindows(Some(notify_window), 0) };
-
-    let deadline = Instant::now() + LIVE_ELECTION_TIMEOUT;
-    while Instant::now() < deadline {
-        thread::sleep(LIVE_ELECTION_INTERVAL);
-        let after = sample_candidates(runtime, candidates)?;
-        if let Some(index) = select_progressing_candidate(&before, &after) {
-            return Some(candidates[index]);
-        }
+    match elect_progressing_candidate(
+        || sample_candidates(runtime, candidates),
+        || {
+            unsafe { EnumWindows(Some(notify_window), 0) };
+        },
+    ) {
+        Election::Elected(index) => Some(candidates[index]),
+        Election::Unreadable | Election::Ambiguous { .. } => None,
     }
-    None
 }
 
 /// Reads the scheduler fields of every candidate. A candidate that cannot be

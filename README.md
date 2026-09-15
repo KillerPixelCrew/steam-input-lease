@@ -832,7 +832,7 @@ Release returns before rediscovery completes, so give it a second before conclud
 | Package | Output | Responsibility |
 | --- | --- | --- |
 | `steam-input-lease-core` | rlib | Wire protocol, capability flags, pipe naming |
-| `steam-input-recovery` | rlib | Build-independent RTTI, vtable and instruction resolver |
+| `steam-input-recovery` | rlib | Build-independent RTTI, vtable and instruction resolver; live-object election |
 | `steam-input-lease` | rlib | Discovery, pipe client, leases, process wrapper, opt-in injection |
 | `steam-input-gate` | `steam_input_gate.dll` | Proxy forwarders and export map, hook engine, pipe server, startup trace |
 | `steam-input-lease-ffi` | `steam_input_lease_ffi.dll` | Stable C ABI |

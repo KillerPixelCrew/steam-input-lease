@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 
 use steam_input_lease_core::{Command, Request, Response};
 use steam_input_recovery::{
-    RecoveryLayout, SchedulerSample, find_vtable_pairs, memory_is_readable,
-    resolve_recovery_layout, select_progressing_candidate,
+    Election, RecoveryLayout, SchedulerSample, elect_progressing_candidate, find_vtable_pairs,
+    memory_is_readable, resolve_recovery_layout,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BAD_LENGTH, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PIPE_BUSY,
@@ -96,13 +96,6 @@ const MODULE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 // Not exposed by the selected windows-sys API surface; value from the SDK.
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
-
-// How long the live-object election watches Steam's scheduler fields, and how
-// often it looks. The nudge makes the running thread reschedule well inside
-// this budget; the timeout only bounds the case where Steam never moves, which
-// ends in the same fail-closed error the election replaced.
-const LIVE_ELECTION_TIMEOUT: Duration = Duration::from_millis(1500);
-const LIVE_ELECTION_INTERVAL: Duration = Duration::from_millis(125);
 
 // EnumWindows carries no user state through this crate's callback, so the
 // target process is published for the duration of one enumeration. Elections
@@ -1072,33 +1065,24 @@ unsafe fn elect_running_hid_thread(
 ) -> Result<usize> {
     let deadline_offset = layout.discovery_deadline_offset as usize;
     let counter_offset = layout.discovery_counter_offset as usize;
-    let Some(before) =
-        (unsafe { sample_candidates(process, candidates, deadline_offset, counter_offset) })
-    else {
-        return Err(unreadable_candidates(candidates));
-    };
-    notify_device_change(process_id);
-
-    let deadline = Instant::now() + LIVE_ELECTION_TIMEOUT;
-    let mut last = before.clone();
-    while Instant::now() < deadline {
-        thread::sleep(LIVE_ELECTION_INTERVAL);
-        let Some(after) =
-            (unsafe { sample_candidates(process, candidates, deadline_offset, counter_offset) })
-        else {
-            return Err(unreadable_candidates(candidates));
-        };
-        if let Some(index) = select_progressing_candidate(&before, &after) {
-            return Ok(candidates[index]);
-        }
-        last = after;
+    match elect_progressing_candidate(
+        || unsafe { sample_candidates(process, candidates, deadline_offset, counter_offset) },
+        || notify_device_change(process_id),
+    ) {
+        Election::Elected(index) => Ok(candidates[index]),
+        Election::Unreadable => Err(unreadable_candidates(candidates)),
+        // The election gave up. Embed each candidate's first→last scheduler reading
+        // so wsgm.log distinguishes the two failure modes without a debugger: all
+        // "still" means the rebuilt HID thread had not resumed discovery inside the
+        // window (a timing problem), while two or more "MOVED" means genuinely live
+        // look-alikes that these two fields cannot separate (needs another field).
+        // Without a second observation, the last reading is the first one.
+        Election::Ambiguous { before, last } => Err(ambiguous_candidates(
+            candidates,
+            &before,
+            last.as_deref().unwrap_or(&before),
+        )),
     }
-    // The election gave up. Embed each candidate's first→last scheduler reading
-    // so wsgm.log distinguishes the two failure modes without a debugger: all
-    // "still" means the rebuilt HID thread had not resumed discovery inside the
-    // window (a timing problem), while two or more "MOVED" means genuinely live
-    // look-alikes that these two fields cannot separate (needs another field).
-    Err(ambiguous_candidates(candidates, &before, &last))
 }
 
 /// Reads the scheduler fields of every candidate. A candidate that cannot be

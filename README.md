@@ -460,7 +460,8 @@ intentionally has no detach or unload call.
 
 ## C#
 
-The binding targets `net8.0-windows10.0.17763.0` and wraps both opaque handle types in `SafeHandle`.
+The binding targets `net8.0-windows10.0.17763.0` and wraps each opaque handle (client, lease and
+pass-through claim) in a `SafeHandle`.
 It calls `sil_abi_version()` before every other native entry point used to create a client and
 refuses any version other than ABI 4.
 

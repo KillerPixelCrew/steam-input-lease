@@ -1,6 +1,4 @@
 using System;
-using System.Threading;
-using Microsoft.Win32.SafeHandles;
 
 namespace SteamInterop;
 
@@ -22,31 +20,22 @@ public sealed class SteamInputPassThrough : IDisposable
     /// <returns>The remaining payload status.</returns>
     /// <exception cref="ObjectDisposedException">The claim was already released or disposed.</exception>
     /// <exception cref="SteamInputLeaseException">Acknowledgement failed; the claim is consumed regardless.</exception>
-    public SteamInputStatus Release()
-    {
-        var handle = Interlocked.Exchange(ref _handle, null)
-            ?? throw new ObjectDisposedException(nameof(SteamInputPassThrough));
-        using (handle)
+    public SteamInputStatus Release() => ConsumableHandle.Consume(
+        ref _handle,
+        nameof(SteamInputPassThrough),
+        static claim =>
         {
-            NativeMethods.ThrowIfFailed(NativeMethods.sil_pass_through_release(handle.Take(), out var status));
+            NativeMethods.ThrowIfFailed(NativeMethods.sil_pass_through_release(claim, out var status));
             return SteamInputStatus.FromNative(status);
-        }
-    }
+        });
 
     /// <summary>Closes the claim without waiting for acknowledgement.</summary>
-    public void Dispose() => Interlocked.Exchange(ref _handle, null)?.Dispose();
+    public void Dispose() => ConsumableHandle.Close(ref _handle);
 }
 
-internal sealed class PassThroughHandle : SafeHandleZeroOrMinusOneIsInvalid
+internal sealed class PassThroughHandle : ConsumableHandle
 {
-    internal PassThroughHandle(nint value) : base(ownsHandle: true) => SetHandle(value);
-
-    internal nint Take()
-    {
-        nint value = handle;
-        SetHandleAsInvalid();
-        return value;
-    }
+    internal PassThroughHandle(nint value) : base(value) { }
 
     protected override bool ReleaseHandle()
     {

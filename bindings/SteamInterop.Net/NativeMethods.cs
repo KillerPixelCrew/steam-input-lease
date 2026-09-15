@@ -156,11 +156,28 @@ internal sealed class ClientHandle : SafeHandleZeroOrMinusOneIsInvalid
     }
 }
 
-internal sealed class LeaseHandle : SafeHandleZeroOrMinusOneIsInvalid
+// An opaque native allocation that an explicit release call consumes. The owner
+// holds it in a nullable field so release and disposal each claim it once.
+internal abstract class ConsumableHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
-    internal LeaseHandle(nint value) : base(ownsHandle: true) => SetHandle(value);
+    protected ConsumableHandle(nint value) : base(ownsHandle: true) => SetHandle(value);
 
-    internal nint Take()
+    internal static TResult Consume<THandle, TResult>(
+        ref THandle? slot, string ownerName, Func<nint, TResult> release)
+        where THandle : ConsumableHandle
+    {
+        THandle handle = Interlocked.Exchange(ref slot, null)
+            ?? throw new ObjectDisposedException(ownerName);
+        using (handle)
+        {
+            return release(handle.Take());
+        }
+    }
+
+    internal static void Close<THandle>(ref THandle? slot)
+        where THandle : ConsumableHandle => Interlocked.Exchange(ref slot, null)?.Dispose();
+
+    private nint Take()
     {
         // Explicit native release consumes the opaque allocation. Invalidating
         // first prevents SafeHandle finalization from destroying it twice.
@@ -168,6 +185,11 @@ internal sealed class LeaseHandle : SafeHandleZeroOrMinusOneIsInvalid
         SetHandleAsInvalid();
         return value;
     }
+}
+
+internal sealed class LeaseHandle : ConsumableHandle
+{
+    internal LeaseHandle(nint value) : base(value) { }
 
     protected override bool ReleaseHandle()
     {

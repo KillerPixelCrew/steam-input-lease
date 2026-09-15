@@ -1,6 +1,5 @@
 using System;
 using System.Runtime.InteropServices;
-using System.Threading;
 
 namespace SteamInterop;
 
@@ -207,17 +206,14 @@ public sealed class SteamInputBlockLease : IDisposable
     /// </remarks>
     /// <exception cref="ObjectDisposedException">The lease was already released or disposed.</exception>
     /// <exception cref="SteamInputLeaseException">The explicit release handshake failed.</exception>
-    public SteamInputReleaseOutcome Release()
-    {
-        LeaseHandle handle = Interlocked.Exchange(ref _handle, null)
-            ?? throw new ObjectDisposedException(nameof(SteamInputBlockLease));
-        using (handle)
+    public SteamInputReleaseOutcome Release() => ConsumableHandle.Consume(
+        ref _handle,
+        nameof(SteamInputBlockLease),
+        static lease =>
         {
-            NativeMethods.ThrowIfFailed(
-                NativeMethods.sil_lease_release(handle.Take(), out var outcome));
+            NativeMethods.ThrowIfFailed(NativeMethods.sil_lease_release(lease, out var outcome));
             return FromNative(outcome);
-        }
-    }
+        });
 
     // internal, not private: SteamInputClient.RunWrapped reports the same outcome for
     // the release it performs itself, and both must decode it identically.
@@ -249,5 +245,5 @@ public sealed class SteamInputBlockLease : IDisposable
     /// The payload treats EOF as release. Unlike <see cref="Release"/>, disposal
     /// cannot return recovery status to the caller.
     /// </remarks>
-    public void Dispose() => Interlocked.Exchange(ref _handle, null)?.Dispose();
+    public void Dispose() => ConsumableHandle.Close(ref _handle);
 }

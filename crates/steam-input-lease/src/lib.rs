@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 
 use steam_input_lease_core::{Command, Request, Response};
 use steam_input_recovery::{
-    RecoveryLayout, SchedulerSample, find_vtable_pairs, resolve_recovery_layout,
-    select_progressing_candidate,
+    RecoveryLayout, SchedulerSample, find_vtable_pairs, memory_is_readable,
+    resolve_recovery_layout, select_progressing_candidate,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BAD_LENGTH, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PIPE_BUSY,
@@ -68,8 +68,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD,
-    PAGE_NOACCESS, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx, VirtualQueryEx,
+    MEM_COMMIT, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+    VirtualAllocEx, VirtualFreeEx, VirtualQueryEx,
 };
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -908,12 +908,6 @@ fn validate_remote_hid_thread(target: &RemoteRecoveryTarget) -> bool {
     }
 }
 
-fn memory_is_readable(memory: &MEMORY_BASIC_INFORMATION) -> bool {
-    memory.State == MEM_COMMIT
-        && memory.Protect & PAGE_GUARD == 0
-        && memory.Protect & PAGE_NOACCESS == 0
-}
-
 unsafe fn snapshot_remote_module(process: HANDLE, module: RemoteModule) -> Result<Vec<u8>> {
     if module.size == 0 || module.size > MODULE_SNAPSHOT_LIMIT {
         return Err(Error::UnsupportedSteamBuild(
@@ -945,7 +939,7 @@ unsafe fn snapshot_remote_module(process: HANDLE, module: RemoteModule) -> Resul
             address = address.saturating_add(0x1000);
             continue;
         }
-        if memory_is_readable(&memory) {
+        if memory_is_readable(memory.State, memory.Protect) {
             let destination = region_start - module.base;
             let length = region_end - region_start;
             let mut transferred = 0;
@@ -992,7 +986,7 @@ unsafe fn find_remote_hid_thread(
         }
         let region_start = memory.BaseAddress as usize;
         let region_end = region_start.saturating_add(memory.RegionSize);
-        if memory_is_readable(&memory) && memory.Type == MEM_PRIVATE {
+        if memory_is_readable(memory.State, memory.Protect) && memory.Type == MEM_PRIVATE {
             let mut chunk_start = region_start;
             while chunk_start < region_end {
                 let chunk_end = chunk_start

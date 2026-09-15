@@ -36,8 +36,8 @@ use steam_input_lease_core::{
     Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response, ResultCode,
 };
 use steam_input_recovery::{
-    RecoveryLayout, SchedulerSample, find_vtable_pairs, resolve_recovery_layout,
-    select_progressing_candidate,
+    RecoveryLayout, SchedulerSample, find_vtable_pairs, memory_is_readable,
+    resolve_recovery_layout, select_progressing_candidate,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes};
 use windows_sys::Win32::Foundation::{
@@ -64,9 +64,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
     GetProcAddress,
 };
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
-};
+use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -1481,12 +1479,6 @@ unsafe fn read_current<T: Copy>(address: usize) -> Option<T> {
     (ok && transferred == size_of::<T>()).then_some(value)
 }
 
-fn memory_is_readable(memory: &MEMORY_BASIC_INFORMATION) -> bool {
-    memory.State == MEM_COMMIT
-        && memory.Protect & PAGE_GUARD == 0
-        && memory.Protect & PAGE_NOACCESS == 0
-}
-
 fn current_module_size(base: usize) -> Option<usize> {
     // Read SizeOfImage from the mapped PE32+ headers. The shared resolver will
     // independently validate every header field before it trusts a section.
@@ -1532,7 +1524,7 @@ fn snapshot_current_range(base: usize, size: usize) -> Vec<u8> {
             address = address.saturating_add(0x1000);
             continue;
         }
-        if memory_is_readable(&memory) {
+        if memory_is_readable(memory.State, memory.Protect) {
             let destination = region_start - base;
             let length = region_end - region_start;
             let mut transferred = 0;
@@ -1655,7 +1647,7 @@ fn find_hid_thread(runtime: &RuntimeRecoveryLayout, ignore_budget: bool) -> Opti
         }
         let region_start = memory.BaseAddress as usize;
         let region_end = region_start.saturating_add(memory.RegionSize);
-        if memory_is_readable(&memory) && memory.Type == MEM_PRIVATE {
+        if memory_is_readable(memory.State, memory.Protect) && memory.Type == MEM_PRIVATE {
             let mut chunk_start = region_start;
             while chunk_start < region_end {
                 let chunk_end = chunk_start

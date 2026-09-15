@@ -162,6 +162,22 @@ pub fn select_progressing_candidate(
     progressing
 }
 
+// Win32 MEM_COMMIT, PAGE_NOACCESS and PAGE_GUARD. This crate has no windows-sys
+// dependency, so the documented SDK values are spelled out here.
+const MEM_COMMIT: u32 = 0x1000;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_GUARD: u32 = 0x100;
+
+/// Returns whether a queried memory region can be read without faulting.
+///
+/// `state` and `protect` are the region's `MEMORY_BASIC_INFORMATION` `State`
+/// and `Protect` values. Only committed regions that are neither no-access nor
+/// guard pages qualify.
+#[must_use]
+pub const fn memory_is_readable(state: u32, protect: u32) -> bool {
+    state == MEM_COMMIT && protect & PAGE_GUARD == 0 && protect & PAGE_NOACCESS == 0
+}
+
 /// Finds the addresses in a memory snapshot that begin an object carrying both
 /// halves of a resolved vtable pair.
 ///
@@ -910,6 +926,16 @@ mod tests {
         let before = [sample(f64::NAN, 1), sample(500.0, 1)];
         let after = [sample(f64::NAN, 1), sample(600.0, 1)];
         assert_eq!(select_progressing_candidate(&before, &after), Some(1));
+    }
+
+    #[test]
+    fn only_committed_accessible_regions_are_readable() {
+        const PAGE_READWRITE: u32 = 0x04;
+        const MEM_RESERVE: u32 = 0x2000;
+        assert!(memory_is_readable(MEM_COMMIT, PAGE_READWRITE));
+        assert!(!memory_is_readable(MEM_RESERVE, PAGE_READWRITE));
+        assert!(!memory_is_readable(MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD));
+        assert!(!memory_is_readable(MEM_COMMIT, PAGE_NOACCESS));
     }
 
     #[test]

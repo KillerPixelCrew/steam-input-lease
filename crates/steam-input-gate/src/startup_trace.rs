@@ -2,13 +2,14 @@
 //!
 //! `DllMain` and proxy exports only touch atomics. File creation and writes happen
 //! on the gate worker after the loader lock is released, so tracing cannot become
-//! another Steam startup dependency. One small file is written per Steam process
-//! under `%LOCALAPPDATA%\WSGM` and survives a later manual restart for comparison.
+//! another Steam startup dependency. One small file is written per Steam process,
+//! beside the gate's own image or in WSGM's log directory when WSGM deployed it,
+//! and survives a later manual restart for comparison.
 
 use std::fmt::Display;
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -29,6 +30,10 @@ static MISSING_OPTIONAL_EXPORTS: AtomicUsize = AtomicUsize::new(0);
 
 /// How many per-pid traces survive in the log directory.
 const TRACE_RETENTION: usize = 8;
+
+/// Extension of the deployment stamp WSGM writes beside a proxy it deployed,
+/// `XInput1_4.dll` becoming `XInput1_4.wsgm-shim`.
+const WSGM_DEPLOYMENT_STAMP_EXTENSION: &str = "wsgm-shim";
 
 /// Records entry into the process-attach path without allocation or I/O.
 pub(crate) fn mark_attach_entered() {
@@ -88,10 +93,11 @@ pub(crate) struct StartupTrace {
 }
 
 impl StartupTrace {
-    /// Opens the per-process trace and writes the atomically captured loader phases.
-    pub(crate) fn open() -> Self {
+    /// Opens the per-process trace for the gate loaded from `image` and writes the
+    /// atomically captured loader phases.
+    pub(crate) fn open(image: &Path) -> Self {
         let worker_started = Instant::now();
-        let file = trace_path().and_then(|path| {
+        let file = trace_path(image).and_then(|path| {
             if let Some(parent) = path.parent() {
                 if create_dir_all(parent).is_err() {
                     return None;
@@ -156,8 +162,38 @@ impl StartupTrace {
 }
 
 #[cfg(test)]
-fn trace_path() -> Option<PathBuf> {
+fn trace_path(_image: &Path) -> Option<PathBuf> {
     None
+}
+
+/// Chooses the trace directory for a gate loaded from `image`.
+///
+/// A standalone gate writes beside its own image, which is where someone who
+/// dropped it into Steam's folder looks. A gate WSGM deployed writes to WSGM's
+/// log directory, where WSGM reads it back; WSGM says so by keeping its
+/// deployment stamp beside the proxy. The stamp only chooses between these two
+/// fixed directories. It never names a path and never proves ownership.
+fn trace_directory(
+    image: &Path,
+    wsgm_managed: bool,
+    local_app_data: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if wsgm_managed {
+        local_app_data.map(|path| path.join("WSGM"))
+    } else {
+        image
+            .parent()
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    }
+}
+
+/// Whether WSGM's deployment stamp sits beside `image`.
+#[cfg(not(test))]
+fn wsgm_managed(image: &Path) -> bool {
+    image
+        .with_extension(WSGM_DEPLOYMENT_STAMP_EXTENSION)
+        .is_file()
 }
 
 /// The directory override exists only for `scripts/test-lifecycle.ps1` and is
@@ -216,11 +252,63 @@ fn prune_old_traces(directory: &std::path::Path, keep: usize) {
 }
 
 #[cfg(not(test))]
-fn trace_path() -> Option<PathBuf> {
+fn trace_path(image: &Path) -> Option<PathBuf> {
     let directory = trace_directory_override().or_else(|| {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|path| path.join("WSGM"))
+        trace_directory(
+            image,
+            wsgm_managed(image),
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        )
     })?;
     Some(directory.join(format!("steam-input-gate-{}.log", std::process::id())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_standalone_gate_traces_beside_its_own_image() {
+        assert_eq!(
+            trace_directory(
+                Path::new(r"C:\Steam\XInput1_4.dll"),
+                false,
+                Some(PathBuf::from(r"C:\Users\someone\AppData\Local")),
+            ),
+            Some(PathBuf::from(r"C:\Steam"))
+        );
+    }
+
+    #[test]
+    fn a_wsgm_deployed_gate_traces_to_the_wsgm_log_directory() {
+        assert_eq!(
+            trace_directory(
+                Path::new(r"C:\Steam\XInput1_4.dll"),
+                true,
+                Some(PathBuf::from(r"C:\Users\someone\AppData\Local")),
+            ),
+            Some(PathBuf::from(r"C:\Users\someone\AppData\Local\WSGM"))
+        );
+        assert_eq!(
+            trace_directory(Path::new(r"C:\Steam\XInput1_4.dll"), true, None),
+            None
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_directory_has_no_trace_directory() {
+        assert_eq!(trace_directory(Path::new(""), false, None), None);
+    }
+
+    #[test]
+    fn the_wsgm_stamp_sits_beside_the_proxy_under_its_own_stem() {
+        assert_eq!(
+            Path::new(r"C:\Steam\XInput1_4.dll").with_extension(WSGM_DEPLOYMENT_STAMP_EXTENSION),
+            PathBuf::from(r"C:\Steam\XInput1_4.wsgm-shim")
+        );
+        assert_eq!(
+            Path::new(r"C:\Steam\dinput8.dll").with_extension(WSGM_DEPLOYMENT_STAMP_EXTENSION),
+            PathBuf::from(r"C:\Steam\dinput8.wsgm-shim")
+        );
+    }
 }

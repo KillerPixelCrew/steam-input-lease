@@ -18,8 +18,10 @@
 #![deny(missing_docs)]
 
 use std::cell::Cell;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::mem::{size_of, transmute_copy, zeroed};
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
@@ -50,8 +52,8 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY,
-    TokenOwner,
+    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+    TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATEFILE2_EXTENDED_PARAMETERS, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN,
@@ -2098,20 +2100,15 @@ unsafe extern "system" fn client_thread(parameter: *mut c_void) -> u32 {
     0
 }
 
-/// Emits the one line that says how this payload got into the process.
+/// Full path of this image, empty when Windows cannot report it.
 ///
-/// Out of band on purpose: the wire `Response` is a fixed 24-byte struct with no
-/// spare field, and the host does not need the vector over the pipe - it already
-/// knows which name it deployed and learns whether that name took from the pipe
-/// existing at all. This line is the human-facing half, readable in DebugView on
-/// a device where nothing else is attached.
-fn report_load_vector(module: HMODULE) -> Vector {
-    // The classification is load-bearing (an Unknown verdict skips forwarding
-    // initialization entirely and every export then stays on its disconnected
-    // fallback for the life of the process), so this must not truncate. MAX_PATH is
-    // not enough: a Steam library under a deep path fills the buffer, and a
-    // truncated tail loses the file name the verdict is derived from. Grow until
-    // the call stops reporting a full buffer.
+/// The vector classification is derived from the file name and is load-bearing
+/// (an Unknown verdict skips forwarding initialization entirely and every export
+/// then stays on its disconnected fallback for the life of the process), so this
+/// must not truncate. MAX_PATH is not enough: a Steam library under a deep path
+/// fills the buffer, and a truncated tail loses the file name. Grow until the call
+/// stops reporting a full buffer.
+fn module_path(module: HMODULE) -> PathBuf {
     let mut buffer = vec![0u16; 260];
     let length = loop {
         let length = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) }
@@ -2127,12 +2124,22 @@ fn report_load_vector(module: HMODULE) -> Vector {
         }
         buffer.resize(buffer.len() * 2, 0);
     };
-    let path = String::from_utf16_lossy(&buffer[..length.min(buffer.len())]);
-    let file_name = path
-        .rsplit(std::path::MAIN_SEPARATOR)
-        .next()
+    PathBuf::from(OsString::from_wide(&buffer[..length.min(buffer.len())]))
+}
+
+/// Emits the one line that says how this payload got into the process.
+///
+/// Out of band on purpose: the wire `Response` is a fixed 24-byte struct with no
+/// spare field, and the host does not need the vector over the pipe - it already
+/// knows which name it deployed and learns whether that name took from the pipe
+/// existing at all. This line is the human-facing half, readable in DebugView on
+/// a device where nothing else is attached.
+fn report_load_vector(image: &Path) -> Vector {
+    let file_name = image
+        .file_name()
+        .map(|name| name.to_string_lossy())
         .unwrap_or_default();
-    let vector = classify_vector(file_name);
+    let vector = classify_vector(&file_name);
     let message = format!("WSGM SteamInputGate loaded: vector={}\n", vector.label());
     let wide: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
     unsafe { OutputDebugStringW(wide.as_ptr()) };
@@ -2186,7 +2193,7 @@ fn ensure_hooks_installed() -> bool {
 }
 
 // The gate's duplex client requires full pipe access. Restricting the descriptor
-// to System, administrators and the token owner also prevents read-only opens
+// to System, administrators and the token's owner and user also prevents read-only opens
 // from consuming an accept-loop instance and worker.
 
 /// Longest string SID accepted from `ConvertSidToStringSidW`.
@@ -2195,40 +2202,92 @@ fn ensure_hooks_installed() -> bool {
 /// terminator cannot turn the scan into an unbounded read.
 const SID_STRING_MAX_CHARS: usize = 512;
 
-/// Upper bound on the `TokenOwner` information buffer.
+/// Upper bound on a token information buffer.
 ///
 /// `GetTokenInformation` reports the size it wants; this caps how much of that
 /// report is trusted so a nonsense length cannot become a huge allocation.
-const TOKEN_OWNER_MAX_BYTES: u32 = 4096;
+const TOKEN_INFORMATION_MAX_BYTES: u32 = 4096;
 
 /// Builds the SDDL text for the control pipe's DACL.
 ///
-/// `owner_sid` is the current token owner, not its user. `CREATOR OWNER` is
-/// expanded only for inherited ACEs, so a directly applied descriptor must name
-/// the resolved owner explicitly. System and administrators retain their normal
-/// access, and no mandatory label changes which integrity levels can connect.
-fn control_pipe_sddl(owner_sid: &str) -> String {
-    format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{owner_sid})")
+/// `owner_sid` is the current token's owner and `user_sid` its user. They are the
+/// same account for an unelevated Steam. For an elevated Steam the owner is
+/// `BUILTIN\Administrators`, which is deny-only in the same user's unelevated
+/// processes, so without the user ACE every ordinary program would be refused.
+/// `CREATOR OWNER` is expanded only for inherited ACEs, so a directly applied
+/// descriptor must name both explicitly. System and administrators retain their
+/// normal access, and no mandatory label changes which integrity levels can
+/// connect.
+fn control_pipe_sddl(owner_sid: &str, user_sid: Option<&str>) -> String {
+    let mut sddl = format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{owner_sid})");
+    if let Some(user_sid) = user_sid.filter(|user_sid| !user_sid.eq_ignore_ascii_case(owner_sid)) {
+        sddl.push_str(&format!("(A;;FA;;;{user_sid})"));
+    }
+    sddl
 }
 
-/// Reads the current process token's owner SID in string (`S-1-...`) form.
+/// Reads the current process token's owner and user SIDs in string (`S-1-...`)
+/// form.
 ///
-/// Returns `None` when the token cannot be opened or read, or when the SID
-/// cannot be rendered. The caller then keeps the default descriptor rather than
-/// refusing to listen.
+/// Returns `None` when the token cannot be opened or its owner cannot be read or
+/// rendered. The caller then keeps the default descriptor rather than refusing to
+/// listen. A missing user SID only leaves out the user ACE.
 ///
 /// # Safety
 /// Every raw pointer passed to Win32 here is a live local or a buffer this
-/// function owns for the whole call, and the token handle is closed on both
-/// paths. Nothing here can panic, so nothing can unwind out of the gate worker.
-fn current_token_owner_sid() -> Option<String> {
+/// function owns for the whole call, and the token handle is closed on every
+/// path. Nothing here can panic, so nothing can unwind out of the gate worker.
+fn current_token_sids() -> Option<(String, Option<String>)> {
     let mut token: HANDLE = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == FALSE {
         return None;
     }
     let owner = read_token_owner_sid(token);
+    let user = read_token_user_sid(token);
     unsafe { CloseHandle(token) };
-    owner
+    owner.map(|owner| (owner, user))
+}
+
+/// Reads one token information class into a buffer the caller interprets.
+///
+/// `minimum` is the size of the fixed header the caller will copy out. Returns
+/// `None` when the size probe does not behave as documented, the reported size
+/// is implausible, or the read fails.
+///
+/// # Safety
+/// `token` must be a token handle opened with `TOKEN_QUERY`; it is only read.
+fn read_token_information(
+    token: HANDLE,
+    class: TOKEN_INFORMATION_CLASS,
+    minimum: usize,
+) -> Option<Vec<u8>> {
+    let mut needed = 0u32;
+    // The probing call is expected to fail with ERROR_INSUFFICIENT_BUFFER; the
+    // length it reports is the only thing wanted from it.
+    let probed = unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut needed) };
+    if probed == FALSE && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+        // Documented behaviour is failure with a required length. Anything else
+        // is unexpected enough that guessing at the buffer would be wrong.
+        return None;
+    }
+    if (needed as usize) < minimum || needed > TOKEN_INFORMATION_MAX_BYTES {
+        return None;
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    let mut written = needed;
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &mut written,
+        )
+    };
+    if read == FALSE || (written as usize) < minimum {
+        return None;
+    }
+    Some(buffer)
 }
 
 /// Renders the `TokenOwner` SID of an already-open token.
@@ -2242,37 +2301,29 @@ fn current_token_owner_sid() -> Option<String> {
 /// (`cast_ptr_alignment` is pedantic-only). The copied `Owner` pointer borrows
 /// `buffer`, so it is consumed before `buffer` is dropped.
 fn read_token_owner_sid(token: HANDLE) -> Option<String> {
-    let mut needed = 0u32;
-    // The probing call is expected to fail with ERROR_INSUFFICIENT_BUFFER; the
-    // length it reports is the only thing wanted from it.
-    let probed = unsafe { GetTokenInformation(token, TokenOwner, null_mut(), 0, &mut needed) };
-    if probed == FALSE && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-        // Documented behaviour is failure with a required length. Anything else
-        // is unexpected enough that guessing at the buffer would be wrong.
-        return None;
-    }
-    if needed < size_of::<TOKEN_OWNER>() as u32 || needed > TOKEN_OWNER_MAX_BYTES {
-        return None;
-    }
-    let mut buffer = vec![0u8; needed as usize];
-    let mut written = needed;
-    let read = unsafe {
-        GetTokenInformation(
-            token,
-            TokenOwner,
-            buffer.as_mut_ptr().cast::<c_void>(),
-            needed,
-            &mut written,
-        )
-    };
-    if read == FALSE || written < size_of::<TOKEN_OWNER>() as u32 {
-        return None;
-    }
+    let buffer = read_token_information(token, TokenOwner, size_of::<TOKEN_OWNER>())?;
     let owner = unsafe { core::ptr::read_unaligned::<TOKEN_OWNER>(buffer.as_ptr().cast()) };
     if owner.Owner.is_null() {
         return None;
     }
     let sid = sid_to_string(owner.Owner);
+    drop(buffer);
+    sid
+}
+
+/// Renders the `TokenUser` SID of an already-open token.
+///
+/// # Safety
+/// Same contract as [`read_token_owner_sid`]: the `TOKEN_USER` header is copied
+/// out with `read_unaligned`, and its `Sid` pointer borrows `buffer`, so it is
+/// consumed before `buffer` is dropped.
+fn read_token_user_sid(token: HANDLE) -> Option<String> {
+    let buffer = read_token_information(token, TokenUser, size_of::<TOKEN_USER>())?;
+    let user = unsafe { core::ptr::read_unaligned::<TOKEN_USER>(buffer.as_ptr().cast()) };
+    if user.User.Sid.is_null() {
+        return None;
+    }
+    let sid = sid_to_string(user.User.Sid);
     drop(buffer);
     sid
 }
@@ -2348,22 +2399,24 @@ fn build_security_descriptor(sddl: &str) -> Option<LocalSecurityDescriptor> {
     Some(LocalSecurityDescriptor(descriptor))
 }
 
-/// Builds the control pipe's descriptor and reports the owner SID it scoped to.
+/// Builds the control pipe's descriptor and reports the owner and user SIDs it
+/// scoped to.
 ///
 /// `None` means the gate FAILS OPEN to the default descriptor. That is today's
 /// exact behaviour and must stay: a gate that refused to listen would break
 /// controller blocking outright on a machine where the SDDL work fails, which is
 /// strictly worse than the resource exposure this removes.
-fn build_control_pipe_descriptor() -> Option<(LocalSecurityDescriptor, String)> {
-    let owner = current_token_owner_sid()?;
-    let descriptor = build_security_descriptor(&control_pipe_sddl(&owner))?;
-    Some((descriptor, owner))
+fn build_control_pipe_descriptor() -> Option<(LocalSecurityDescriptor, String, Option<String>)> {
+    let (owner, user) = current_token_sids()?;
+    let descriptor = build_security_descriptor(&control_pipe_sddl(&owner, user.as_deref()))?;
+    Some((descriptor, owner, user))
 }
 
 unsafe extern "system" fn server_thread(parameter: *mut c_void) -> u32 {
-    let mut startup_trace = StartupTrace::open();
     let pinned = parameter as HMODULE;
-    let vector = report_load_vector(pinned);
+    let image = module_path(pinned);
+    let mut startup_trace = StartupTrace::open(&image);
+    let vector = report_load_vector(&image);
     startup_trace.log(format_args!("worker entered; vector={}", vector.label()));
     if matches!(vector, Vector::XInput14 | Vector::DInput8) {
         // ValvePlug's proxy starts blocked. Preserve that safe property while
@@ -2405,7 +2458,7 @@ unsafe extern "system" fn server_thread(parameter: *mut c_void) -> u32 {
     // could retire the server for the life of this steam.exe - the image is
     // pinned, so DllMain never runs again and the pipe could not be revived.
     let scoped = build_control_pipe_descriptor();
-    let attributes = scoped.as_ref().map(|(descriptor, _)| SECURITY_ATTRIBUTES {
+    let attributes = scoped.as_ref().map(|(descriptor, _, _)| SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.as_ptr(),
         bInheritHandle: FALSE,
@@ -2416,11 +2469,15 @@ unsafe extern "system" fn server_thread(parameter: *mut c_void) -> u32 {
             value as *const SECURITY_ATTRIBUTES
         });
     startup_trace.log(format_args!(
-        "control pipe descriptor scoped={}; owner={}",
+        "control pipe descriptor scoped={}; owner={}; user={}",
         attributes.is_some(),
         scoped
             .as_ref()
-            .map_or("<unavailable>", |(_, owner)| owner.as_str())
+            .map_or("<unavailable>", |(_, owner, _)| owner.as_str()),
+        scoped
+            .as_ref()
+            .and_then(|(_, _, user)| user.as_deref())
+            .unwrap_or("<unavailable>")
     ));
     let pipe_name = steam_input_lease_core::pipe_name(unsafe { GetCurrentProcessId() });
     let mut pipe_failures = 0u32;
@@ -2564,18 +2621,37 @@ mod tests {
     use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
     const SAMPLE_OWNER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
 
     #[test]
     fn control_pipe_sddl_grants_system_administrators_and_the_token_owner() {
         assert_eq!(
-            control_pipe_sddl(SAMPLE_OWNER),
+            control_pipe_sddl(SAMPLE_OWNER, None),
             "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-21-1111111111-2222222222-3333333333-1001)"
         );
     }
 
     #[test]
+    fn control_pipe_sddl_names_the_user_once_when_it_owns_the_token() {
+        assert_eq!(
+            control_pipe_sddl(SAMPLE_OWNER, Some(SAMPLE_OWNER)),
+            control_pipe_sddl(SAMPLE_OWNER, None)
+        );
+    }
+
+    #[test]
+    fn control_pipe_sddl_grants_the_user_of_an_elevated_token() {
+        // An elevated token is owned by Administrators, which is deny-only in the
+        // same user's unelevated processes; the user ACE is what lets them in.
+        assert_eq!(
+            control_pipe_sddl(ADMINISTRATORS, Some(SAMPLE_OWNER)),
+            "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-32-544)(A;;FA;;;S-1-5-21-1111111111-2222222222-3333333333-1001)"
+        );
+    }
+
+    #[test]
     fn control_pipe_sddl_drops_the_default_everyone_and_anonymous_read_aces() {
-        let sddl = control_pipe_sddl(SAMPLE_OWNER);
+        let sddl = control_pipe_sddl(ADMINISTRATORS, Some(SAMPLE_OWNER));
         assert!(
             !sddl.contains(";WD)"),
             "Everyone survived the scoped DACL: {sddl}"
@@ -2591,17 +2667,19 @@ mod tests {
         // A malformed string would make build_security_descriptor return None,
         // the worker would fall back to the default descriptor, and the whole
         // change would be a silent no-op.
-        let descriptor = build_security_descriptor(&control_pipe_sddl(SAMPLE_OWNER));
+        let descriptor =
+            build_security_descriptor(&control_pipe_sddl(ADMINISTRATORS, Some(SAMPLE_OWNER)));
         assert!(descriptor.is_some());
     }
 
     #[test]
-    fn the_built_descriptor_carries_only_the_three_intended_aces() {
+    fn the_built_descriptor_carries_only_the_intended_aces() {
         // Rendering the descriptor Windows actually built - rather than the
         // string that was handed to it - is what proves the kernel-visible DACL
         // really lost the Everyone and ANONYMOUS read ACEs.
         let descriptor =
-            build_security_descriptor(&control_pipe_sddl(SAMPLE_OWNER)).expect("valid SDDL");
+            build_security_descriptor(&control_pipe_sddl(SAMPLE_OWNER, Some(SAMPLE_OWNER)))
+                .expect("valid SDDL");
         let mut text: *mut u16 = null_mut();
         let converted = unsafe {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
@@ -2650,14 +2728,21 @@ mod tests {
     #[test]
     fn build_control_pipe_descriptor_scopes_the_pipe_for_this_token() {
         let scoped = build_control_pipe_descriptor();
-        let (_descriptor, owner) = scoped.expect("this token must yield a usable descriptor");
+        let (_descriptor, owner, user) =
+            scoped.expect("this token must yield a usable descriptor");
         assert!(owner.starts_with("S-1-"), "unexpected owner SID: {owner}");
+        let user = user.expect("this token must expose a user");
+        assert!(user.starts_with("S-1-"), "unexpected user SID: {user}");
     }
 
     #[test]
-    fn current_token_owner_sid_returns_a_string_sid() {
-        let owner = current_token_owner_sid().expect("the current token must expose an owner");
+    fn current_token_sids_returns_string_sids() {
+        let (owner, user) = current_token_sids().expect("the current token must expose an owner");
         assert!(owner.starts_with("S-1-"), "unexpected owner SID: {owner}");
+        assert!(
+            user.is_some_and(|user| user.starts_with("S-1-5-")),
+            "the current token must expose a user SID"
+        );
     }
 
     #[test]

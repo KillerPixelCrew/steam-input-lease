@@ -4,21 +4,28 @@ Builds and packages all release surfaces.
 
 .DESCRIPTION
 Builds the complete Cargo workspace and .NET binding, then creates a portable
-artifact directory and a win-x64 NuGet package. Native DLLs are copied both
-beside the CLI (for direct execution) and under native/ (for embedding).
+artifact directory, a win-x64 NuGet package and the standalone download. Native
+DLLs are copied both beside the launcher (for direct execution) and under
+native/ (for embedding).
 
 .PARAMETER Runtime
 Artifact directory label. The build target is explicitly
 x86_64-pc-windows-msvc and the produced PE headers are verified as x64, so the
 value is constrained to win-x64.
 
+.PARAMETER SkipTests
+Skip the Cargo test run, to hand a build to manual testing first. Clippy, the
+documentation build and packaging still run. A release build runs the tests.
+
 .OUTPUTS
-artifacts/<Runtime> and artifacts/packages/SteamInputLease.<version>.nupkg.
+artifacts/<Runtime>, artifacts/packages/SteamInputLease.<version>.nupkg and
+artifacts/steam-input-lease-<version>-<Runtime>.zip.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('win-x64')]
-    [string]$Runtime = 'win-x64'
+    [string]$Runtime = 'win-x64',
+    [switch]$SkipTests
 )
 
 Set-StrictMode -Version Latest
@@ -72,9 +79,11 @@ function Assert-X64PortableExecutable {
 
 # Safe, non-Steam verification gates. The lifecycle injection test remains a
 # separate explicit command because packaging must not start any process.
-Invoke-Checked cargo @(
-    'test', '--workspace', '--target', $rustTarget, '--manifest-path', $manifest
-) 'Cargo tests failed'
+if (-not $SkipTests) {
+    Invoke-Checked cargo @(
+        'test', '--workspace', '--target', $rustTarget, '--manifest-path', $manifest
+    ) 'Cargo tests failed'
+}
 Invoke-Checked cargo @(
     'clippy', '--workspace', '--all-targets', '--target', $rustTarget,
     '--manifest-path', $manifest, '--', '-D', 'warnings'
@@ -141,4 +150,25 @@ Invoke-Checked dotnet @(
     'pack', $managedProject, '-c', 'Release', '-o', $packages, '--no-build', '--nologo'
 ) '.NET package build failed'
 
+# The standalone download holds the two files a user drops beside steam.exe,
+# already under the name Steam loads, plus the documentation and licences.
+$metadata = & cargo metadata --no-deps --format-version 1 --manifest-path $manifest | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) {
+    throw "Cargo metadata failed (exit code $LASTEXITCODE)"
+}
+$version = ($metadata.packages | Where-Object name -eq 'steam-input-lease-cli').version
+$standalone = Join-Path $workspace "artifacts\standalone\$Runtime"
+if (Test-Path -LiteralPath $standalone) {
+    Remove-Item -LiteralPath $standalone -Recurse -Force
+}
+New-Item -ItemType Directory -Path $standalone | Out-Null
+Copy-Item -LiteralPath (Join-Path $release 'steam_input_gate.dll') -Destination (Join-Path $standalone 'XInput1_4.dll')
+Copy-Item -LiteralPath (Join-Path $release 'steam-input-lease.exe') -Destination $standalone
+foreach ($document in @('README.md', 'LICENSE-MIT', 'THIRD_PARTY_LICENSES.md')) {
+    Copy-Item -LiteralPath (Join-Path $workspace $document) -Destination $standalone
+}
+$download = Join-Path $workspace "artifacts\steam-input-lease-$version-$Runtime.zip"
+Compress-Archive -Path (Join-Path $standalone '*') -DestinationPath $download -Force
+
 Write-Output "Built Steam Input Lease artifacts at $artifactRoot"
+Write-Output "Built the standalone download at $download"

@@ -78,7 +78,7 @@ try {
         throw "Test target did not answer an unblocked probe within 5s (not listening, or the fake HID path was blocked before acquiring a lease)"
     }
 
-    & $launcher --target-name steam-input-test-target.exe --payload $payload -- $target --probe-client $port --expect-blocked
+    & $launcher --target-name steam-input-test-target.exe --inject --payload $payload -- $target --probe-client $port --expect-blocked
     if ($LASTEXITCODE -ne 0) {
         throw "Rust payload did not gate the fake HID path while leased"
     }
@@ -110,7 +110,7 @@ try {
         throw "Fake HID path remained blocked after releasing the lease"
     }
 
-    & $launcher --target-name steam-input-test-target.exe --payload $payload -- $target --child
+    & $launcher --target-name steam-input-test-target.exe --inject --payload $payload -- $target --child
     if ($LASTEXITCODE -ne 23) {
         throw "Wrapper returned $LASTEXITCODE; expected child exit code 23"
     }
@@ -120,7 +120,7 @@ try {
     try {
         $env:SDL_GAMECONTROLLER_IGNORE_DEVICES = '0x28de/0x1205'
         $env:SteamAppId = '1234'
-        & $launcher --target-name steam-input-test-target.exe --payload $payload -- `
+        & $launcher --target-name steam-input-test-target.exe --inject --payload $payload -- `
             "$env:SystemRoot\System32\cmd.exe" /d /c `
             'if defined SDL_GAMECONTROLLER_IGNORE_DEVICES (exit /b 41) else if "%SteamAppId%"=="1234" (exit /b 0) else (exit /b 42)'
         if ($LASTEXITCODE -ne 0) {
@@ -139,7 +139,7 @@ try {
     # that waits only for the root returns before this marker exists; a real job
     # tree wait returns only after the descendant has written it and exited.
     $descendantMarker = Join-Path $resolvedTraceDirectory 'descendant-completed.txt'
-    & $launcher --target-name steam-input-test-target.exe --payload $payload -- `
+    & $launcher --target-name steam-input-test-target.exe --inject --payload $payload -- `
         $target --child-tree $descendantMarker
     if ($LASTEXITCODE -ne 23) {
         throw "Process-tree wrapper returned $LASTEXITCODE; expected root exit code 23"

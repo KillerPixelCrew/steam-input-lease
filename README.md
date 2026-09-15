@@ -15,7 +15,8 @@ and installs no hook until the first lease is taken. The first lease closes Stea
 handles and denies new access, concurrent leases are reference-counted, and releasing the last lease
 restores pass-through and asks Steam to rediscover controllers without restarting it.
 
-It ships as a Rust API, a stable C ABI (version 4), a .NET 8 binding and a diagnostic CLI. Injection
+It ships as a Rust API, a stable C ABI (version 4), a .NET 8 binding and a console launcher that
+works without writing any code. Injection
 through remote `LoadLibraryW` still exists, but only as an explicit opt-in for a launch wrapper on a
 machine where the proxy is not deployed, and for this repository's own tests. A client left at its
 defaults cannot inject.
@@ -24,16 +25,95 @@ defaults cannot inject.
 > `0.1.0` enables and disables blocking dynamically but never unloads the payload DLL. That is
 > deliberate. See [Payload lifetime](#payload-lifetime).
 
-Contents: [Quick start](#quick-start) · [How it works](#how-it-works) ·
-[Proxy delivery](#proxy-delivery) · [Lease lifecycle](#lease-lifecycle) · [Rust](#rust) ·
-[C ABI](#c-abi) · [C#](#c) · [CLI](#cli) · [Building and testing](#building-and-testing) ·
+Contents: [Standalone use](#standalone-use) · [Quick start](#quick-start) ·
+[How it works](#how-it-works) · [Proxy delivery](#proxy-delivery) ·
+[Lease lifecycle](#lease-lifecycle) · [Rust](#rust) · [C ABI](#c-abi) · [C#](#c) ·
+[Launcher](#launcher) · [Building and testing](#building-and-testing) ·
 [Internals](#internals) · [Controller recovery](#controller-recovery) ·
 [Payload lifetime](#payload-lifetime) · [Compatibility](#compatibility) · [Security](#security) ·
 [Troubleshooting](#troubleshooting) · [Repository and artifact layout](#repository-and-artifact-layout)
 
+## Standalone use
+
+No code is needed. The download, `steam-input-lease-<version>-win-x64.zip`, holds two files that go
+into Steam's folder:
+
+```text
+XInput1_4.dll            the gate, already under the name Steam loads
+steam-input-lease.exe    the launcher your games start through
+```
+
+WSGM deploys this same gate itself. With WSGM installed you do not need these files, and WSGM treats
+a gate it finds in Steam's folder as its own.
+
+### Install
+
+1. Exit Steam completely (Steam > Exit, not just closing the window).
+2. Copy `XInput1_4.dll` and `steam-input-lease.exe` into Steam's folder, next to `steam.exe`. That is
+   usually `C:\Program Files (x86)\Steam`.
+3. If Steam's folder already has an `XInput1_4.dll` (ValvePlug and Special K use the same name), keep
+   that file and rename ours to `dinput8.dll` instead. If both names are taken, the gate cannot sit
+   beside that other program.
+4. Start Steam. It loads the gate on startup, and the gate stays out of the way until a launch asks
+   for a lease.
+
+To check it, open a terminal in Steam's folder and run:
+
+```text
+.\steam-input-lease.exe --status
+```
+
+`Gate active; leases=0 ...` means Steam loaded it.
+
+### Steam games
+
+Open the game's Properties, and under General > Launch Options enter:
+
+```text
+"C:\Program Files (x86)\Steam\steam-input-lease.exe" -- %command%
+```
+
+Use your own Steam path. Options you already had go after `%command%`.
+
+### Non-Steam games added to Steam
+
+A shortcut made with Add a Non-Steam Game takes the same line. Leave Target pointing at the game and
+put the line above into its Launch Options.
+
+### Outside Steam
+
+Steam still has to be running. Make a Windows shortcut whose target is the launcher followed by the
+game and its arguments:
+
+```text
+"C:\Program Files (x86)\Steam\steam-input-lease.exe" -- "D:\Games\Example\game.exe" --any-arguments
+```
+
+### What happens
+
+When the game starts, the launcher takes a lease and Steam stops reading your controllers, so the
+game can open them directly. When the game and every process it started have exited, Steam gets them
+back and looks for them again. A console window stays open behind the game for as long as it runs;
+that is the launcher waiting.
+
+If no lease can be taken, for example because Steam has not restarted since the gate was copied in,
+the game starts anyway without one. The launcher returns the game's exit code.
+
+### Logs
+
+- `steam-input-lease.log` beside the launcher records the last launch, including why no lease was
+  taken.
+- `steam-input-gate-<steam-pid>.log` beside the gate is its startup trace for one Steam run. The
+  newest eight are kept.
+
+### Uninstall
+
+Exit Steam, delete `XInput1_4.dll` (or `dinput8.dll`), `steam-input-lease.exe` and the
+`steam-input-*.log` files from Steam's folder, and remove the launch options.
+
 ## Quick start
 
-Two files matter:
+For applications that take leases themselves, two files matter:
 
 ```text
 steam_input_gate.dll        the payload; deployed into Steam's directory as XInput1_4.dll
@@ -51,10 +131,8 @@ steam_input_lease_ffi.dll   the C ABI your application loads (or the .NET bindin
 
 Deployment is the consumer's job. This library ships the DLL and its ownership marker, and the
 consumer copies, updates and parks it. WSGM's `Core\SteamInputShim.cs` is the reference deployer,
-and its rules are under [Deploying the proxy](#deploying-the-proxy). For a per-game launch wrapper
-the reference consumer is `WSGM.Launch.exe`
-(`"…\WSGM.Launch.exe" [--deelevate] [--input-lease] -- %command%`). The `steam-input-lease.exe` in
-this repository is a diagnostic tool, not the user-facing wrapper.
+and its rules are under [Deploying the proxy](#deploying-the-proxy). A per-game launch wrapper can
+use `steam-input-lease.exe` as it is; see [Launcher](#launcher).
 
 ## How it works
 
@@ -64,7 +142,7 @@ flowchart LR
     Gate[steam_input_gate.dll<br/>deployed as XInput1_4.dll]
     Pipe[Named pipe<br/>SteamInputGate-PID]
     Host[steam-input-lease<br/>host library]
-    CLI[Diagnostic CLI]
+    CLI[Launcher<br/>steam-input-lease.exe]
     ABI[steam_input_lease_ffi.dll<br/>C ABI]
     DotNet[SteamInputLease.dll<br/>.NET binding]
     Game[Game / SDL3 app]
@@ -201,9 +279,11 @@ only then, for the same reason.
 
 ### Startup trace
 
-Every mapped payload writes a per-process trace to
-`%LOCALAPPDATA%\WSGM\steam-input-gate-<steam-pid>.log`, keeping the newest eight. `DllMain` and the
-proxy exports only update atomics; the worker writes the file after the loader lock is released, so
+Every mapped payload writes a per-process trace, `steam-input-gate-<steam-pid>.log`, keeping the
+newest eight. A standalone gate writes it beside its own DLL. A gate WSGM deployed writes it to
+`%LOCALAPPDATA%\WSGM`, where WSGM reads it; WSGM marks its deployments with a `<name>.wsgm-shim` stamp
+beside the proxy. The stamp only chooses between those two directories. `DllMain` and the proxy
+exports only update atomics; the worker writes the file after the loader lock is released, so
 tracing cannot become a startup dependency. Per-pid names keep a failed boot's trace intact when
 Steam is later started by hand for comparison. Debug builds honour `WSGM_STEAM_INPUT_TRACE_DIR`,
 and release builds deliberately do not.
@@ -217,9 +297,29 @@ phase, and a last line at `forwarding initialization started` localizes a stall 
 ### Control pipe
 
 `\\.\pipe\SteamInputGate-<pid>` rejects remote clients and carries an explicit DACL granting full
-access to System, Administrators and the token owner only, so a read-only open cannot consume a pipe
-instance and worker. If token lookup or SDDL conversion fails, the pipe falls back to the default
-descriptor rather than refusing blocking, and the trace says which was used.
+access to System, Administrators, and the owner and user of Steam's token only, so a read-only open
+cannot consume a pipe instance and worker. If token lookup or SDDL conversion fails, the pipe falls
+back to the default descriptor rather than refusing blocking, and the trace says which was used.
+
+The user entry matters when Steam runs elevated. An elevated token is owned by
+`BUILTIN\Administrators`, which is deny-only in the same user's normal processes, so without it only
+elevated programs could take a lease.
+
+| Client | Can connect |
+| --- | --- |
+| Any program the same user runs at normal (medium) integrity | yes |
+| Elevated programs, and services running as SYSTEM | yes |
+| Another user account at normal integrity | no |
+| Low-integrity or AppContainer (sandboxed) processes | no |
+| Another machine | no |
+
+A service runs in session 0, and the client looks for Steam only in its own session, so a service
+still needs its own way to reach the signed-in user's Steam.
+
+Clients open the pipe with identification-level impersonation only, so the server can never act as
+the client, and check with `GetNamedPipeServerProcessId` that the server is the target process. A
+program that creates `SteamInputGate-<pid>` before the gate does is refused with a `Protocol` error
+instead of being trusted with a lease.
 
 ### Deploying the proxy
 
@@ -311,6 +411,10 @@ if let Err(error) = run.release {
     eprintln!("release handshake failed after the process tree exited: {error}");
 }
 ```
+
+`run_unleased` runs a command the same way without a lease and with the environment unchanged. It is
+the fail-open path after `run_wrapped` returns an error, which always means the target never
+started.
 
 Job creation, assignment and thread resume are all required before the target can run. If accounting
 fails only after resume, the library terminates the untrackable job and reports
@@ -524,34 +628,40 @@ x64 images before packing, so use it rather than `dotnet pack`.
 dotnet add package SteamInputLease --version 0.1.0 --source .\artifacts\packages
 ```
 
-## CLI
+## Launcher
 
-`steam-input-lease.exe` is a development and diagnostic front end. It is not shipped to users and,
-unlike every library default, it opts in to injection so it can exercise the gate against a test
-target or a Steam without the proxy deployed.
+`steam-input-lease.exe` is the launcher from [Standalone use](#standalone-use) and the diagnostic
+front end. Like the library defaults, it connects only to a gate Steam already loaded unless
+`--inject` asks for injection.
 
 ```text
+steam-input-lease.exe -- program.exe arguments
 steam-input-lease.exe --status
 steam-input-lease.exe --rescan
-steam-input-lease.exe -- program.exe arguments
-steam-input-lease.exe --target-name process.exe --payload D:\path\steam_input_gate.dll -- command.exe args...
+steam-input-lease.exe --target-name process.exe --inject --payload D:\path\steam_input_gate.dll -- command.exe args...
 ```
 
 | Option | Behavior |
 | --- | --- |
-| `--` | Ends wrapper options; the rest is the child argument vector |
-| `--status` | Queries an already loaded payload; never injects |
+| `--` | Ends launcher options; the rest is the program and its arguments |
+| `--status` | Queries an already loaded gate; never injects |
 | `--rescan` | Guarded two-pass discovery without changing leases |
+| `--inject` | Injects `steam_input_gate.dll` when no gate answers; for tests and diagnostics |
+| `--payload PATH` | The DLL `--inject` loads, instead of the one beside the launcher |
 | `--target-name NAME` | Overrides `steam.exe`; for diagnostics and tests |
-| `--payload PATH` | Overrides the DLL beside the CLI, used when it injects |
 | `--help`, `-h` | Prints usage |
 
-`--status` and `--rescan` take precedence over a wrapped command if both are given. There is no CLI
-flag for `check_recovery`; use the Rust, C or C# API.
+A launch without `--inject` waits two seconds for the gate's pipe, because a resident gate keeps its
+pipe for as long as Steam runs. With `--inject` it keeps the library's ten seconds for a fresh
+payload to start its server. When no lease can be taken, the program still runs through
+`run_unleased`, with its environment unchanged. Each launch rewrites `steam-input-lease.log` beside
+the launcher.
 
-Exit codes: the CLI returns the child's exit code clamped to 0 to 255, so any code at or above 255,
-including NTSTATUS crash codes like `0xC0000005`, becomes `255`. `--status`, `--rescan` and `--help`
-return `0`, and errors return `1`. Library callers receive the full `u32`.
+`--status` and `--rescan` take precedence over a program given on the same line. There is no flag
+for `check_recovery`; use the Rust, C or C# API.
+
+Exit codes: a launch returns the program's full exit code, including NTSTATUS crash codes like
+`0xC0000005`. `--status`, `--rescan` and `--help` return `0`, and errors return `1`.
 
 ## Building and testing
 
@@ -583,7 +693,7 @@ The proxy export map is part of the contract. A consumer's release build should 
 
 `-Profile` defaults to `debug`. The test touches neither Steam nor a real controller. It starts
 `steam-input-test-target.exe` as a TCP-controlled process, injects the gate into it through the
-CLI's opt-in path, then checks that opening a deliberately nonexistent HID-style path:
+launcher's `--inject` path, then checks that opening a deliberately nonexistent HID-style path:
 
 1. fails with an ordinary error, not blocked, before any lease;
 2. fails with `433` (`ERROR_NO_SUCH_DEVICE`) while a lease is held;
@@ -606,9 +716,11 @@ it while keeping `SteamAppId`, with the caller's environment unchanged.
 ```
 
 Builds the workspace and the managed project, then writes the portable layout to
-`artifacts\win-x64` and the NuGet package to `artifacts\packages`. The native target is explicitly
+`artifacts\win-x64`, the NuGet package to `artifacts\packages`, and the standalone download to
+`artifacts\steam-input-lease-<version>-win-x64.zip`. The native target is explicitly
 `x86_64-pc-windows-msvc`, so the `-Runtime` parameter is constrained to `win-x64` and does not
-cross-compile.
+cross-compile. `-SkipTests` leaves out the Cargo test run so a build can go to manual testing first;
+clippy, the documentation build and packaging still run.
 
 The shipped C# sample (`samples\SteamInterop.CSharpExample`) reads `SIL_TARGET_NAME` and
 `SIL_PAYLOAD_PATH` from the environment. Supplying a custom target selects diagnostic mode and
@@ -790,8 +902,9 @@ directory.
 - The host does not bypass access controls, elevate itself or disable security software.
 - Process discovery is restricted to the caller's Windows session, so a service or a second
   signed-in user cannot become the target.
-- The payload pipe rejects remote clients and carries a DACL scoped to System, Administrators and
-  the token owner.
+- The payload pipe rejects remote clients and carries a DACL scoped to System, Administrators, and
+  the owner and user of Steam's token. Clients allow only identification-level impersonation and
+  refuse a pipe served by any process other than the target. See [Control pipe](#control-pipe).
 
 The production library creates no network service. The localhost TCP listener exists only in
 `steam-input-test-target` during the isolated test.
@@ -802,7 +915,9 @@ The production library creates no network service. The localhost TCP listener ex
 | --- | --- |
 | `target process is not running: steam.exe` | Steam is not in your session, or the diagnostic target name is wrong |
 | `multiple ... processes run in this Windows session` | Stop the duplicate diagnostic target, or address it through a single uniquely named executable; name-based discovery refuses ambiguity |
-| `no resident Steam Input payload answered` | The proxy is not deployed under a free vector, or Steam has not cold-started since it was deployed, or the deployer parked it because its management setting is off. Check for `%LOCALAPPDATA%\WSGM\steam-input-gate-<pid>.log` |
+| `no resident Steam Input payload answered` | The proxy is not deployed under a free vector, or Steam has not cold-started since it was deployed, or the deployer parked it because its management setting is off. Check for `steam-input-gate-<pid>.log` beside the gate, or in `%LOCALAPPDATA%\WSGM` for a gate WSGM deployed |
+| `the payload pipe for process N is served by process M` | Another program created the gate's pipe name first. Close process M and restart Steam |
+| `could not connect to payload pipe: Access is denied` | The client is sandboxed, runs at low integrity, or runs as a different user than Steam. See [Control pipe](#control-pipe) |
 | Trace file missing for the running Steam pid | Steam never mapped the payload: wrong directory, wrong name, or the name belongs to another program |
 | Trace ends at `forwarding initialization started` | The real System32 module could not be loaded on the worker; every export stays on its fallback |
 | Trace shows `missing-required` above zero | The vector was refused; the named exports Steam calls every frame did not resolve |
@@ -837,27 +952,31 @@ Release returns before rediscovery completes, so give it a second before conclud
 | `steam-input-lease` | rlib | Discovery, pipe client, leases, process wrapper, opt-in injection |
 | `steam-input-gate` | `steam_input_gate.dll` | Proxy forwarders and export map, hook engine, pipe server, startup trace |
 | `steam-input-lease-ffi` | `steam_input_lease_ffi.dll` | Stable C ABI |
-| `steam-input-lease-cli` | `steam-input-lease.exe` | Diagnostic wrapper; not shipped to users |
+| `steam-input-lease-cli` | `steam-input-lease.exe` | Console launcher and diagnostics; part of the standalone download |
 | `SteamInterop.Net` | `SteamInputLease.dll` | .NET 8 `SafeHandle` binding |
 | `steam-input-test-target` | test exe | Isolated injection validation target |
 
 ```text
-SteamInput/                       artifacts/            (after build.ps1)
-├── crates/                       ├── packages/
-│   ├── steam-input-gate/         │   └── SteamInputLease.0.1.0.nupkg
-│   ├── steam-input-lease/        └── win-x64/
-│   ├── steam-input-lease-cli/        ├── steam-input-lease.exe
-│   ├── steam-input-lease-core/       ├── steam_input_gate.dll
-│   ├── steam-input-lease-ffi/        ├── steam_input_lease_ffi.dll
-│   ├── steam-input-recovery/         ├── LICENSE-MIT
-│   └── steam-input-test-target/      ├── README.md
-├── bindings/SteamInterop.Net/     ├── THIRD_PARTY_LICENSES.md
-├── include/steam_input_lease.h       ├── include/
-├── samples/                          ├── managed/
-└── scripts/                          └── native/
+steam-input-lease/                artifacts/                        (after build.ps1)
+├── crates/                       ├── steam-input-lease-0.1.0-win-x64.zip
+│   ├── steam-input-gate/         ├── standalone/win-x64/           (the zip's contents)
+│   ├── steam-input-lease/        │   ├── XInput1_4.dll
+│   ├── steam-input-lease-cli/    │   ├── steam-input-lease.exe
+│   ├── steam-input-lease-core/   │   └── LICENSE-MIT, README.md, THIRD_PARTY_LICENSES.md
+│   ├── steam-input-lease-ffi/    ├── packages/
+│   ├── steam-input-recovery/     │   └── SteamInputLease.0.1.0.nupkg
+│   └── steam-input-test-target/  └── win-x64/
+├── bindings/SteamInterop.Net/        ├── steam-input-lease.exe
+├── include/steam_input_lease.h       ├── steam_input_gate.dll
+├── samples/                          ├── steam_input_lease_ffi.dll
+└── scripts/                          ├── LICENSE-MIT, README.md, THIRD_PARTY_LICENSES.md
+                                      ├── include/
+                                      ├── managed/
+                                      └── native/
 ```
 
-The root native copies support direct CLI use, and `native/` and `managed/` support embedding and
+The standalone download is for people dropping the gate into Steam's folder. In `win-x64/`, the root
+copies support direct launcher use, and `native/` and `managed/` support embedding and
 redistribution. A consumer ships `steam_input_gate.dll` and `steam_input_lease_ffi.dll`.
 
 ## Credits

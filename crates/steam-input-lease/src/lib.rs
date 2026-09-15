@@ -6,8 +6,9 @@
 //!
 //! # Lifecycle
 //!
-//! [`Client::acquire`] first connects to an existing payload or injects
-//! `steam_input_gate.dll` through remote `LoadLibraryW`. Each payload connection
+//! [`Client::acquire`] connects to the payload Steam already loaded, and injects
+//! `steam_input_gate.dll` through remote `LoadLibraryW` only when
+//! [`ClientOptions::allow_injection`] is set. Each payload connection
 //! represents one lease. Dropping a [`Lease`] closes that connection, which is
 //! the crash-safe release path; [`Lease::release`] additionally waits for an
 //! explicit response. A payload advertising
@@ -51,7 +52,8 @@ use windows_sys::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
@@ -71,7 +73,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
     VirtualAllocEx, VirtualFreeEx, VirtualQueryEx,
 };
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, CreateRemoteThread,
@@ -467,25 +469,9 @@ impl Client {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let arguments: Vec<Vec<u16>> = command
-            .into_iter()
-            .map(|part| part.as_ref().encode_wide().collect())
-            .collect();
-        if arguments.is_empty() {
-            return Err(Error::Message("the wrapped command is empty".into()));
-        }
-        if arguments[0].is_empty() {
-            return Err(Error::Message(
-                "the wrapped executable name is empty".into(),
-            ));
-        }
-        if let Some(index) = arguments.iter().position(|argument| argument.contains(&0)) {
-            return Err(Error::Message(format!(
-                "wrapped command argument {index} contains a NUL character"
-            )));
-        }
+        let arguments = wide_command(command)?;
         let lease = self.acquire()?;
-        let launched = launch_and_wait(&arguments);
+        let launched = launch_and_wait(&arguments, true);
         let released = lease.release();
         match (launched, released) {
             // An error from this function means the target never ran, because that
@@ -668,6 +654,55 @@ impl PassThrough {
     pub fn release(self) -> Result<Status> {
         exchange(self.pipe.raw(), Command::ReleasePassThrough).map(Status::from)
     }
+}
+
+/// Runs a command without a lease and waits for its process tree.
+///
+/// This is the fail-open path for a launcher whose [`Client::run_wrapped`]
+/// returned an error. That error means the target never started, so starting it
+/// here runs it exactly once. The child receives the caller's environment
+/// unchanged, including `SDL_GAMECONTROLLER_IGNORE_DEVICES`, because no lease
+/// makes the controller directly available. Process creation, the job object
+/// and the tree wait are the same as for a wrapped run.
+///
+/// Returns the root process exit code.
+///
+/// # Errors
+/// [`Error::Message`] for an empty command or embedded NUL, and
+/// [`Error::Windows`] when a pre-resume process or job operation fails. As with
+/// [`Client::run_wrapped`], an error means the target never started.
+pub fn run_unleased<I, S>(command: I) -> Result<u32>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    launch_and_wait(&wide_command(command)?, false)
+}
+
+/// Converts and validates a command before any process or Steam work.
+fn wide_command<I, S>(command: I) -> Result<Vec<Vec<u16>>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let arguments: Vec<Vec<u16>> = command
+        .into_iter()
+        .map(|part| part.as_ref().encode_wide().collect())
+        .collect();
+    if arguments.is_empty() {
+        return Err(Error::Message("the wrapped command is empty".into()));
+    }
+    if arguments[0].is_empty() {
+        return Err(Error::Message(
+            "the wrapped executable name is empty".into(),
+        ));
+    }
+    if let Some(index) = arguments.iter().position(|argument| argument.contains(&0)) {
+        return Err(Error::Message(format!(
+            "wrapped command argument {index} contains a NUL character"
+        )));
+    }
+    Ok(arguments)
 }
 
 #[derive(Debug)]
@@ -1400,17 +1435,26 @@ fn connect_pipe(process_id: u32, timeout: Duration) -> Result<OwnedHandle> {
     let deadline = Instant::now() + timeout;
     loop {
         unsafe {
+            // Identification-level quality of service: the gate never needs to
+            // act as the client, and whatever process holds this name must not
+            // be able to impersonate an elevated caller.
             let handle = CreateFileW(
                 name.as_ptr(),
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE,
                 0,
                 null(),
                 OPEN_EXISTING,
-                0,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 null_mut(),
             );
             if handle != INVALID_HANDLE_VALUE {
-                return Ok(OwnedHandle::from_raw(handle));
+                let pipe = OwnedHandle::from_raw(handle);
+                let mut server_process_id = 0;
+                if GetNamedPipeServerProcessId(pipe.raw(), &mut server_process_id) == FALSE {
+                    return Err(Error::windows("could not identify the payload pipe server"));
+                }
+                verify_pipe_server(process_id, server_process_id)?;
+                return Ok(pipe);
             }
             let error = io::Error::last_os_error();
             let code = error.raw_os_error().unwrap_or_default() as u32;
@@ -1436,6 +1480,21 @@ fn connect_pipe(process_id: u32, timeout: Duration) -> Result<OwnedHandle> {
                 WaitNamedPipeW(name.as_ptr(), 100);
             }
         }
+    }
+}
+
+/// Refuses a pipe that the target process does not serve.
+///
+/// The pipe name is derived from the target's process id, but any process of the
+/// same user can create that name before the gate does. Talking to it would
+/// report a lease Steam never granted.
+fn verify_pipe_server(expected_process_id: u32, server_process_id: u32) -> Result<()> {
+    if server_process_id == expected_process_id {
+        Ok(())
+    } else {
+        Err(Error::Protocol(format!(
+            "the payload pipe for process {expected_process_id} is served by process {server_process_id}; refusing to use it"
+        )))
     }
 }
 
@@ -1572,8 +1631,16 @@ fn leased_environment() -> Result<Vec<u16>> {
     }
 }
 
-fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
-    let environment = leased_environment()?;
+/// Starts `arguments` suspended in a job object and waits for the whole tree.
+///
+/// `leased` removes the SDL controller exclusion from the child's environment;
+/// otherwise the child inherits the caller's environment unchanged.
+fn launch_and_wait(arguments: &[Vec<u16>], leased: bool) -> Result<u32> {
+    let environment = if leased {
+        Some(leased_environment()?)
+    } else {
+        None
+    };
     let mut command_line = Vec::new();
     for argument in arguments {
         if !command_line.is_empty() {
@@ -1594,7 +1661,9 @@ fn launch_and_wait(arguments: &[Vec<u16>]) -> Result<u32> {
             null(),
             FALSE,
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
+            environment
+                .as_ref()
+                .map_or(null(), |block| block.as_ptr().cast()),
             null(),
             &startup,
             &mut process,
@@ -1728,6 +1797,25 @@ mod tests {
             .expect_err("an embedded NUL must not reach CreateProcessW");
         assert!(
             matches!(&error, Error::Message(message) if message.contains("NUL")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_pipe_served_by_another_process_is_refused() {
+        assert!(verify_pipe_server(4242, 4242).is_ok());
+        let error = verify_pipe_server(4242, 777).expect_err("a squatted pipe must be refused");
+        assert!(
+            matches!(&error, Error::Protocol(message) if message.contains("777")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unleased_runs_validate_the_command_before_starting_anything() {
+        let error = run_unleased(Vec::<&str>::new()).expect_err("an empty command must be rejected");
+        assert!(
+            matches!(&error, Error::Message(message) if message.contains("empty")),
             "unexpected error: {error}"
         );
     }

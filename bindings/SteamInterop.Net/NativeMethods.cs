@@ -145,8 +145,6 @@ internal static class NativeMethods
 
 internal sealed class ClientHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
-    private ClientHandle() : base(ownsHandle: true) { }
-
     internal ClientHandle(nint value) : base(ownsHandle: true) => SetHandle(value);
 
     protected override bool ReleaseHandle()

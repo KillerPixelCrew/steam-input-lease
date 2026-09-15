@@ -962,20 +962,23 @@ steam-input-lease/                artifacts/                        (after build
 │   ├── steam-input-gate/         ├── standalone/win-x64/           (the zip's contents)
 │   ├── steam-input-lease/        │   ├── XInput1_4.dll
 │   ├── steam-input-lease-cli/    │   ├── steam-input-lease.exe
-│   ├── steam-input-lease-core/   │   └── LICENSE-MIT, README.md, THIRD_PARTY_LICENSES.md
+│   ├── steam-input-lease-core/   │   └── LICENSE-MIT, README.txt, THIRD_PARTY_LICENSES.md
 │   ├── steam-input-lease-ffi/    ├── packages/
 │   ├── steam-input-recovery/     │   └── SteamInputLease.0.1.0.nupkg
 │   └── steam-input-test-target/  └── win-x64/
 ├── bindings/SteamInterop.Net/        ├── steam-input-lease.exe
 ├── include/steam_input_lease.h       ├── steam_input_gate.dll
-├── samples/                          ├── steam_input_lease_ffi.dll
+├── packaging/standalone/README.txt   ├── steam_input_lease_ffi.dll
+├── samples/                          │
 └── scripts/                          ├── LICENSE-MIT, README.md, THIRD_PARTY_LICENSES.md
                                       ├── include/
                                       ├── managed/
                                       └── native/
 ```
 
-The standalone download is for people dropping the gate into Steam's folder. In `win-x64/`, the root
+The standalone download is for people dropping the gate into Steam's folder. Its `README.txt` comes
+from `packaging\standalone\README.txt` and covers only installing and using it; keep it in step with
+[Standalone use](#standalone-use). In `win-x64/`, the root
 copies support direct launcher use, and `native/` and `managed/` support embedding and
 redistribution. A consumer ships `steam_input_gate.dll` and `steam_input_lease_ffi.dll`.
 

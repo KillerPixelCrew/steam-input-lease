@@ -38,7 +38,9 @@ use this file as a substitute for documenting the public contract.
 
 Consumers normally redistribute `steam_input_gate.dll`, `steam_input_lease_ffi.dll`, and optionally
 the managed binding. The standalone download ships the gate as `XInput1_4.dll` beside the launcher,
-for users who copy both into Steam's folder by hand. The test target is a development tool.
+for users who copy both into Steam's folder by hand, with `packaging/standalone/README.txt` as its
+install and usage guide. Keep that file consistent with the README's Standalone use section. The
+test target is a development tool.
 
 ## Compatibility contracts
 

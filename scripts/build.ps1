@@ -151,7 +151,8 @@ Invoke-Checked dotnet @(
 ) '.NET package build failed'
 
 # The standalone download holds the two files a user drops beside steam.exe,
-# already under the name Steam loads, plus the documentation and licences.
+# already under the name Steam loads, a short install and usage guide, and the
+# licences.
 $metadata = & cargo metadata --no-deps --format-version 1 --manifest-path $manifest | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) {
     throw "Cargo metadata failed (exit code $LASTEXITCODE)"
@@ -164,7 +165,7 @@ if (Test-Path -LiteralPath $standalone) {
 New-Item -ItemType Directory -Path $standalone | Out-Null
 Copy-Item -LiteralPath (Join-Path $release 'steam_input_gate.dll') -Destination (Join-Path $standalone 'XInput1_4.dll')
 Copy-Item -LiteralPath (Join-Path $release 'steam-input-lease.exe') -Destination $standalone
-foreach ($document in @('README.md', 'LICENSE-MIT', 'THIRD_PARTY_LICENSES.md')) {
+foreach ($document in @('packaging\standalone\README.txt', 'LICENSE-MIT', 'THIRD_PARTY_LICENSES.md')) {
     Copy-Item -LiteralPath (Join-Path $workspace $document) -Destination $standalone
 }
 $download = Join-Path $workspace "artifacts\steam-input-lease-$version-$Runtime.zip"

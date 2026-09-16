@@ -1,18 +1,19 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SteamInterop;
 
 /// <summary>
-/// Loads and controls the process-global Steam Input gate. Instances are cheap;
-/// active leases are reference-counted inside Steam.
+///     Loads and controls the process-global Steam Input gate. Instances are cheap;
+///     active leases are reference-counted inside Steam.
 /// </summary>
 public sealed class SteamInputClient : IDisposable
 {
     private readonly ClientHandle _handle;
 
     /// <summary>Creates a client with optional process and payload overrides.</summary>
-    /// <param name="options">Options to use, or <see langword="null"/> for defaults.</param>
+    /// <param name="options">Options to use, or <see langword="null" /> for defaults.</param>
     /// <exception cref="SteamInputLeaseException">Native client creation failed.</exception>
     /// <exception cref="NotSupportedException">The loaded native DLL has an incompatible ABI.</exception>
     /// <exception cref="ArgumentException">An option contains an embedded NUL character.</exception>
@@ -29,16 +30,19 @@ public sealed class SteamInputClient : IDisposable
                 options.ConnectTimeout,
                 "The connect timeout must be positive; zero would become the native 10 second default.");
         }
+
         if (options.TargetName.Contains('\0'))
         {
             throw new ArgumentException("The target name cannot contain a NUL character.", nameof(options));
         }
+
         if (options.PayloadPath.Contains('\0'))
         {
             throw new ArgumentException("The payload path cannot contain a NUL character.", nameof(options));
         }
-        nint targetName = Marshal.StringToCoTaskMemUni(options.TargetName);
-        nint payloadPath = Marshal.StringToCoTaskMemUni(options.PayloadPath);
+
+        var targetName = Marshal.StringToCoTaskMemUni(options.TargetName);
+        var payloadPath = Marshal.StringToCoTaskMemUni(options.PayloadPath);
         try
         {
             var nativeOptions = new NativeMethods.ClientOptions
@@ -47,10 +51,10 @@ public sealed class SteamInputClient : IDisposable
                 PayloadPath = payloadPath,
                 // Rounded up: a sub-millisecond value would truncate to zero, the native default.
                 ConnectTimeoutMilliseconds = checked((uint)Math.Ceiling(options.ConnectTimeout.TotalMilliseconds)),
-                AllowInjection = options.AllowInjection ? 1u : 0u,
+                AllowInjection = options.AllowInjection ? 1u : 0u
             };
             NativeMethods.ThrowIfFailed(
-                NativeMethods.sil_client_create(in nativeOptions, out nint client));
+                NativeMethods.sil_client_create(in nativeOptions, out var client));
             _handle = new ClientHandle(client);
         }
         finally
@@ -58,6 +62,12 @@ public sealed class SteamInputClient : IDisposable
             Marshal.FreeCoTaskMem(targetName);
             Marshal.FreeCoTaskMem(payloadPath);
         }
+    }
+
+    /// <summary>Releases the native client configuration handle.</summary>
+    public void Dispose()
+    {
+        _handle.Dispose();
     }
 
     /// <summary>Loads the payload when necessary and returns its current status.</summary>
@@ -86,7 +96,7 @@ public sealed class SteamInputClient : IDisposable
     public SteamInputBlockLease Acquire()
     {
         NativeMethods.ThrowIfFailed(
-            NativeMethods.sil_client_acquire(_handle, out nint lease, out var status));
+            NativeMethods.sil_client_acquire(_handle, out var lease, out var status));
         return new SteamInputBlockLease(new LeaseHandle(lease), SteamInputStatus.FromNative(status));
     }
 
@@ -96,7 +106,7 @@ public sealed class SteamInputClient : IDisposable
     public SteamInputPassThrough AcquirePassThrough()
     {
         NativeMethods.ThrowIfFailed(
-            NativeMethods.sil_client_acquire_pass_through(_handle, out nint claim, out var status));
+            NativeMethods.sil_client_acquire_pass_through(_handle, out var claim, out var status));
         return new SteamInputPassThrough(new PassThroughHandle(claim), SteamInputStatus.FromNative(status));
     }
 
@@ -114,23 +124,28 @@ public sealed class SteamInputClient : IDisposable
             result.ScanCountAfter);
     }
 
-    /// <summary>Validates host-side controller recovery for the current Steam
-    /// build without acquiring a lease or changing controller state.</summary>
+    /// <summary>
+    ///     Validates host-side controller recovery for the current Steam
+    ///     build without acquiring a lease or changing controller state.
+    /// </summary>
     /// <exception cref="SteamInputLeaseException">The current Steam build cannot be safely resolved.</exception>
-    public void CheckRecovery() => NativeMethods.ThrowIfFailed(
-        NativeMethods.sil_client_check_recovery(_handle));
+    public void CheckRecovery()
+    {
+        NativeMethods.ThrowIfFailed(
+            NativeMethods.sil_client_check_recovery(_handle));
+    }
 
     /// <summary>Runs a process tree while Steam Input is blocked.</summary>
     /// <param name="arguments">Executable followed by its individual arguments.</param>
     /// <returns>The root process exit code and the final release handshake.</returns>
     /// <remarks>
-    /// The root process starts suspended, is assigned to a Windows job object,
-    /// and is then resumed. Release is attempted even when launch/wait fails.
-    /// The child environment omits Steam's <c>SDL_GAMECONTROLLER_IGNORE_DEVICES</c>
-    /// exclusion so SDL can see the leased controllers. Other variables and the
-    /// caller's environment are preserved.
+    ///     The root process starts suspended, is assigned to a Windows job object,
+    ///     and is then resumed. Release is attempted even when launch/wait fails.
+    ///     The child environment omits Steam's <c>SDL_GAMECONTROLLER_IGNORE_DEVICES</c>
+    ///     exclusion so SDL can see the leased controllers. Other variables and the
+    ///     caller's environment are preserved.
     /// </remarks>
-    /// <exception cref="ArgumentNullException"><paramref name="arguments"/> is null.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="arguments" /> is null.</exception>
     /// <exception cref="ArgumentException">No executable was supplied.</exception>
     /// <exception cref="SteamInputLeaseException">The native lifecycle failed.</exception>
     public SteamInputWrappedRun RunWrapped(params string[] arguments)
@@ -140,12 +155,14 @@ public sealed class SteamInputClient : IDisposable
         {
             throw new ArgumentException("At least one command argument is required.", nameof(arguments));
         }
-        for (int index = 0; index < arguments.Length; index++)
+
+        for (var index = 0; index < arguments.Length; index++)
         {
             if (arguments[index] is null)
             {
                 throw new ArgumentException($"Command argument {index} is null.", nameof(arguments));
             }
+
             if (arguments[index].Contains('\0'))
             {
                 throw new ArgumentException(
@@ -153,43 +170,42 @@ public sealed class SteamInputClient : IDisposable
             }
         }
 
-        nint pointerArray = Marshal.AllocCoTaskMem(arguments.Length * IntPtr.Size);
+        var pointerArray = Marshal.AllocCoTaskMem(arguments.Length * IntPtr.Size);
         var strings = new nint[arguments.Length];
         try
         {
-            for (int index = 0; index < arguments.Length; index++)
+            for (var index = 0; index < arguments.Length; index++)
             {
                 strings[index] = Marshal.StringToCoTaskMemUni(arguments[index]);
                 Marshal.WriteIntPtr(pointerArray, index * IntPtr.Size, strings[index]);
             }
+
             NativeMethods.ThrowIfFailed(NativeMethods.sil_client_run_wrapped(
                 _handle,
                 checked((nuint)arguments.Length),
                 pointerArray,
-                out uint exitCode,
+                out var exitCode,
                 out var release));
             return new SteamInputWrappedRun(exitCode, SteamInputBlockLease.FromNative(release));
         }
         finally
         {
-            foreach (nint value in strings)
+            foreach (var value in strings)
             {
                 if (value != 0)
                 {
                     Marshal.FreeCoTaskMem(value);
                 }
             }
+
             Marshal.FreeCoTaskMem(pointerArray);
         }
     }
-
-    /// <summary>Releases the native client configuration handle.</summary>
-    public void Dispose() => _handle.Dispose();
 }
 
 /// <summary>
-/// Holds one block lease. Call <see cref="Release"/> for a synchronous release
-/// and recovery-scheduling handshake; disposal still closes the crash-safe pipe.
+///     Holds one block lease. Call <see cref="Release" /> for a synchronous release
+///     and recovery-scheduling handshake; disposal still closes the crash-safe pipe.
 /// </summary>
 public sealed class SteamInputBlockLease : IDisposable
 {
@@ -204,25 +220,38 @@ public sealed class SteamInputBlockLease : IDisposable
     /// <summary>Gets the status captured immediately after acquiring the lease.</summary>
     public SteamInputStatus InitialStatus { get; }
 
+    /// <summary>Closes the crash-safe pipe when explicit release was not used.</summary>
+    /// <remarks>
+    ///     The payload treats EOF as release. Unlike <see cref="Release" />, disposal
+    ///     cannot return recovery status to the caller.
+    /// </remarks>
+    public void Dispose()
+    {
+        ConsumableHandle.Close(ref _handle);
+    }
+
     /// <summary>Synchronously releases the lease and requests controller recovery.</summary>
     /// <returns>The release status plus what happened to controller recovery.</returns>
     /// <remarks>
-    /// This throws only when the release handshake itself fails. Closing the
-    /// pipe has already lifted blocking by the time recovery is attempted, so a
-    /// recovery failure is reported through
-    /// <see cref="SteamInputReleaseOutcome.Recovery"/> rather than as an
-    /// exception. The lease is consumed either way.
+    ///     This throws only when the release handshake itself fails. Closing the
+    ///     pipe has already lifted blocking by the time recovery is attempted, so a
+    ///     recovery failure is reported through
+    ///     <see cref="SteamInputReleaseOutcome.Recovery" /> rather than as an
+    ///     exception. The lease is consumed either way.
     /// </remarks>
     /// <exception cref="ObjectDisposedException">The lease was already released or disposed.</exception>
     /// <exception cref="SteamInputLeaseException">The explicit release handshake failed.</exception>
-    public SteamInputReleaseOutcome Release() => ConsumableHandle.Consume(
-        ref _handle,
-        nameof(SteamInputBlockLease),
-        static lease =>
-        {
-            NativeMethods.ThrowIfFailed(NativeMethods.sil_lease_release(lease, out var outcome));
-            return FromNative(outcome);
-        });
+    public SteamInputReleaseOutcome Release()
+    {
+        return ConsumableHandle.Consume(
+            ref _handle,
+            nameof(SteamInputBlockLease),
+            static lease =>
+            {
+                NativeMethods.ThrowIfFailed(NativeMethods.sil_lease_release(lease, out var outcome));
+                return FromNative(outcome);
+            });
+    }
 
     // internal, not private: SteamInputClient.RunWrapped reports the same outcome for
     // the release it performs itself, and both must decode it identically.
@@ -241,18 +270,12 @@ public sealed class SteamInputBlockLease : IDisposable
         {
             var bytes = new ReadOnlySpan<byte>(
                 outcome.RecoveryMessage, NativeMethods.RecoveryMessageCapacity);
-            int length = bytes.IndexOf((byte)0);
-            message = System.Text.Encoding.UTF8.GetString(
+            var length = bytes.IndexOf((byte)0);
+            message = Encoding.UTF8.GetString(
                 length < 0 ? bytes : bytes[..length]);
         }
+
         return new SteamInputReleaseOutcome(
             SteamInputStatus.FromNative(outcome.Status), recovery, rescan, message);
     }
-
-    /// <summary>Closes the crash-safe pipe when explicit release was not used.</summary>
-    /// <remarks>
-    /// The payload treats EOF as release. Unlike <see cref="Release"/>, disposal
-    /// cannot return recovery status to the caller.
-    /// </remarks>
-    public void Dispose() => ConsumableHandle.Close(ref _handle);
 }

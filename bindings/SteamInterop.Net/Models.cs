@@ -5,35 +5,41 @@ namespace SteamInterop;
 
 /// <summary>Configuration for locating a target process and its Rust payload.</summary>
 /// <remarks>
-/// The production defaults target the current-session <c>steam.exe</c> and a
-/// payload Steam loaded itself, as a search-order proxy DLL deployed into its
-/// own install directory. Injection is opt-in through
-/// <see cref="AllowInjection"/>; host and target architectures and integrity
-/// levels must match on that path.
+///     The production defaults target the current-session <c>steam.exe</c> and a
+///     payload Steam loaded itself, as a search-order proxy DLL deployed into its
+///     own install directory. Injection is opt-in through
+///     <see cref="AllowInjection" />; host and target architectures and integrity
+///     levels must match on that path.
 /// </remarks>
 public sealed class SteamInputClientOptions
 {
     /// <summary>Gets the executable name of the process receiving the payload.</summary>
     public string TargetName { get; init; } = "steam.exe";
 
-    /// <summary>Gets the path to <c>steam_input_gate.dll</c>, used only when
-    /// <see cref="AllowInjection"/> is set.</summary>
+    /// <summary>
+    ///     Gets the path to <c>steam_input_gate.dll</c>, used only when
+    ///     <see cref="AllowInjection" /> is set.
+    /// </summary>
     public string PayloadPath { get; init; } = Path.Combine(AppContext.BaseDirectory, "steam_input_gate.dll");
 
     /// <summary>Gets the maximum control-pipe startup wait.</summary>
-    /// <remarks>Must be positive, and is rounded up to whole milliseconds. The native API reads
-    /// zero as "use the 10 second default", so zero is refused rather than passed through as a
-    /// silently long wait.</remarks>
+    /// <remarks>
+    ///     Must be positive, and is rounded up to whole milliseconds. The native API reads
+    ///     zero as "use the 10 second default", so zero is refused rather than passed through as a
+    ///     silently long wait.
+    /// </remarks>
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>Gets whether this client may inject the payload when no resident
-    /// one answers.</summary>
+    /// <summary>
+    ///     Gets whether this client may inject the payload when no resident
+    ///     one answers.
+    /// </summary>
     /// <remarks>
-    /// Defaults to <see langword="false"/>. The payload is normally delivered as
-    /// a proxy DLL Steam loads from its own directory, and a client that cannot
-    /// reach one is expected to fail open rather than write into Steam. Only the
-    /// per-game launch wrapper opts in, and only when the user has Steam Input
-    /// Management turned off, because then no resident payload exists.
+    ///     Defaults to <see langword="false" />. The payload is normally delivered as
+    ///     a proxy DLL Steam loads from its own directory, and a client that cannot
+    ///     reach one is expected to fail open rather than write into Steam. Only the
+    ///     per-game launch wrapper opts in, and only when the user has Steam Input
+    ///     Management turned off, because then no resident payload exists.
     /// </remarks>
     public bool AllowInjection { get; init; }
 }
@@ -58,11 +64,14 @@ public readonly record struct SteamInputStatus(
     /// <summary>Gets whether a pass-through claim currently overrides block leases.</summary>
     public bool IsPassThroughActive => (Capabilities & 4) != 0;
 
-    internal static SteamInputStatus FromNative(NativeMethods.Status value) => new(
-        value.Capabilities,
-        value.LeaseCount,
-        value.HidHandleCount,
-        value.LastRevokedHandleCount);
+    internal static SteamInputStatus FromNative(NativeMethods.Status value)
+    {
+        return new SteamInputStatus(
+            value.Capabilities,
+            value.LeaseCount,
+            value.HidHandleCount,
+            value.LastRevokedHandleCount);
+    }
 }
 
 /// <summary>Diagnostics from Steam's guarded two-pass controller discovery.</summary>
@@ -74,32 +83,43 @@ public readonly record struct SteamControllerRescanResult(
     uint ScanCountBefore,
     uint ScanCountAfter);
 
-/// <summary>Whether and how Steam was asked to rediscover controllers after a
-/// lease was released.</summary>
+/// <summary>
+///     Whether and how Steam was asked to rediscover controllers after a
+///     lease was released.
+/// </summary>
 public enum SteamControllerRecovery
 {
     /// <summary>The target is not Steam, so no controller recovery applies.</summary>
     NotRequired = 0,
 
-    /// <summary>The payload scheduled discovery on its own timer. Controllers
-    /// reappear shortly after the release returns.</summary>
+    /// <summary>
+    ///     The payload scheduled discovery on its own timer. Controllers
+    ///     reappear shortly after the release returns.
+    /// </summary>
     Scheduled = 1,
 
     /// <summary>The host ran the guarded two-pass recovery inline.</summary>
     Completed = 2,
 
-    /// <summary>Recovery could not run. Blocking was still lifted, so Steam
-    /// keeps working; it has simply not been told to look for controllers
-    /// again, and one may stay missing until Steam notices by itself.</summary>
-    Unavailable = 3,
+    /// <summary>
+    ///     Recovery could not run. Blocking was still lifted, so Steam
+    ///     keeps working; it has simply not been told to look for controllers
+    ///     again, and one may stay missing until Steam notices by itself.
+    /// </summary>
+    Unavailable = 3
 }
 
-/// <summary>Result of an explicit release. Blocking has been lifted whenever
-/// this is returned.</summary>
+/// <summary>
+///     Result of an explicit release. Blocking has been lifted whenever
+///     this is returned.
+/// </summary>
 /// <param name="Status">Payload status from the release handshake.</param>
 /// <param name="Recovery">Whether and how Steam was asked to rediscover controllers.</param>
-/// <param name="Rescan">Scan-counter observations, present only when <paramref name="Recovery"/> is <see cref="SteamControllerRecovery.Completed"/>.</param>
-/// <param name="RecoveryMessage">Why recovery could not run, or <see langword="null"/>.</param>
+/// <param name="Rescan">
+///     Scan-counter observations, present only when <paramref name="Recovery" /> is
+///     <see cref="SteamControllerRecovery.Completed" />.
+/// </param>
+/// <param name="RecoveryMessage">Why recovery could not run, or <see langword="null" />.</param>
 public readonly record struct SteamInputReleaseOutcome(
     SteamInputStatus Status,
     SteamControllerRecovery Recovery,
@@ -111,13 +131,17 @@ public readonly record struct SteamInputReleaseOutcome(
         Recovery is SteamControllerRecovery.Scheduled or SteamControllerRecovery.Completed;
 }
 
-/// <summary>The result of a wrapped run: the target ran to completion, and the lease
-/// was then released.</summary>
+/// <summary>
+///     The result of a wrapped run: the target ran to completion, and the lease
+///     was then released.
+/// </summary>
 /// <param name="ExitCode">Root process exit code.</param>
-/// <param name="Release">What the final release handshake did. A handshake that failed
-/// after the target exited is reported here rather than as a run failure — reporting it
-/// as one would make a fail-open caller start the finished game a second time — but it
-/// means Steam was left without controller recovery, so callers should log it.</param>
+/// <param name="Release">
+///     What the final release handshake did. A handshake that failed
+///     after the target exited is reported here rather than as a run failure — reporting it
+///     as one would make a fail-open caller start the finished game a second time — but it
+///     means Steam was left without controller recovery, so callers should log it.
+/// </param>
 public readonly record struct SteamInputWrappedRun(
     uint ExitCode,
     SteamInputReleaseOutcome Release);
@@ -129,7 +153,10 @@ public sealed class SteamInputLeaseException : Exception
     /// <param name="message">UTF-8 error message copied from the native thread.</param>
     /// <param name="nativeResult">Nonzero native ABI result code.</param>
     public SteamInputLeaseException(string message, int nativeResult)
-        : base(message) => NativeResult = nativeResult;
+        : base(message)
+    {
+        NativeResult = nativeResult;
+    }
 
     /// <summary>The nonzero native ABI result code.</summary>
     public int NativeResult { get; }

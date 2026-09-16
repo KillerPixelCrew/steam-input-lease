@@ -12,53 +12,9 @@ internal static class NativeMethods
     // this boundary.
     private const string Library = "steam_input_lease_ffi";
     internal const uint ExpectedAbiVersion = 4;
-    private static int _abiValidated;
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct ClientOptions
-    {
-        internal nint TargetName;
-        internal nint PayloadPath;
-        internal uint ConnectTimeoutMilliseconds;
-
-        // ABI 4. Non-zero lets the client inject the payload when no resident
-        // one answers; zero restricts it to a payload Steam loaded itself from
-        // its own directory. WSGM leaves this zero everywhere, so its own
-        // surfaces cannot write into the Steam process at all.
-        internal uint AllowInjection;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct Status
-    {
-        internal ushort Capabilities;
-        internal ushort Reserved;
-        internal uint LeaseCount;
-        internal uint HidHandleCount;
-        internal uint LastRevokedHandleCount;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct RescanResult
-    {
-        internal double PreviousDeadline;
-        internal uint ScanCountBefore;
-        internal uint ScanCountAfter;
-    }
 
     internal const int RecoveryMessageCapacity = 256;
-
-    // Blittable by design: the inline UTF-8 message is a fixed byte array, so
-    // this struct needs no custom marshaller at the native boundary.
-    [StructLayout(LayoutKind.Sequential)]
-    internal unsafe struct ReleaseOutcome
-    {
-        internal Status Status;
-        internal uint Recovery;
-        internal uint Reserved;
-        internal RescanResult Rescan;
-        internal fixed byte RecoveryMessage[RecoveryMessageCapacity];
-    }
+    private static int _abiValidated;
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern uint sil_abi_version();
@@ -117,8 +73,8 @@ internal static class NativeMethods
             return;
         }
 
-        string message = Marshal.PtrToStringUTF8(sil_last_error_message())
-            ?? "The native Steam Input Lease operation failed.";
+        var message = Marshal.PtrToStringUTF8(sil_last_error_message())
+                      ?? "The native Steam Input Lease operation failed.";
         throw new SteamInputLeaseException(message, result);
     }
 
@@ -132,7 +88,7 @@ internal static class NativeMethods
         // This MUST be the first native operation made by a managed client. A
         // different ABI may use different struct sizes, so even asking it for
         // an error string or creating a client would already be unsafe.
-        uint actual = sil_abi_version();
+        var actual = sil_abi_version();
         if (actual != ExpectedAbiVersion)
         {
             throw new NotSupportedException(
@@ -141,11 +97,58 @@ internal static class NativeMethods
 
         Volatile.Write(ref _abiValidated, 1);
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ClientOptions
+    {
+        internal nint TargetName;
+        internal nint PayloadPath;
+        internal uint ConnectTimeoutMilliseconds;
+
+        // ABI 4. Non-zero lets the client inject the payload when no resident
+        // one answers; zero restricts it to a payload Steam loaded itself from
+        // its own directory. WSGM leaves this zero everywhere, so its own
+        // surfaces cannot write into the Steam process at all.
+        internal uint AllowInjection;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct Status
+    {
+        internal ushort Capabilities;
+        internal ushort Reserved;
+        internal uint LeaseCount;
+        internal uint HidHandleCount;
+        internal uint LastRevokedHandleCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct RescanResult
+    {
+        internal double PreviousDeadline;
+        internal uint ScanCountBefore;
+        internal uint ScanCountAfter;
+    }
+
+    // Blittable by design: the inline UTF-8 message is a fixed byte array, so
+    // this struct needs no custom marshaller at the native boundary.
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct ReleaseOutcome
+    {
+        internal Status Status;
+        internal uint Recovery;
+        internal uint Reserved;
+        internal RescanResult Rescan;
+        internal fixed byte RecoveryMessage[RecoveryMessageCapacity];
+    }
 }
 
 internal sealed class ClientHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
-    internal ClientHandle(nint value) : base(ownsHandle: true) => SetHandle(value);
+    internal ClientHandle(nint value) : base(true)
+    {
+        SetHandle(value);
+    }
 
     protected override bool ReleaseHandle()
     {
@@ -158,14 +161,17 @@ internal sealed class ClientHandle : SafeHandleZeroOrMinusOneIsInvalid
 // holds it in a nullable field so release and disposal each claim it once.
 internal abstract class ConsumableHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
-    protected ConsumableHandle(nint value) : base(ownsHandle: true) => SetHandle(value);
+    protected ConsumableHandle(nint value) : base(true)
+    {
+        SetHandle(value);
+    }
 
     internal static TResult Consume<THandle, TResult>(
         ref THandle? slot, string ownerName, Func<nint, TResult> release)
         where THandle : ConsumableHandle
     {
-        THandle handle = Interlocked.Exchange(ref slot, null)
-            ?? throw new ObjectDisposedException(ownerName);
+        var handle = Interlocked.Exchange(ref slot, null)
+                     ?? throw new ObjectDisposedException(ownerName);
         using (handle)
         {
             return release(handle.Take());
@@ -173,13 +179,16 @@ internal abstract class ConsumableHandle : SafeHandleZeroOrMinusOneIsInvalid
     }
 
     internal static void Close<THandle>(ref THandle? slot)
-        where THandle : ConsumableHandle => Interlocked.Exchange(ref slot, null)?.Dispose();
+        where THandle : ConsumableHandle
+    {
+        Interlocked.Exchange(ref slot, null)?.Dispose();
+    }
 
     private nint Take()
     {
         // Explicit native release consumes the opaque allocation. Invalidating
         // first prevents SafeHandle finalization from destroying it twice.
-        nint value = handle;
+        var value = handle;
         SetHandleAsInvalid();
         return value;
     }
@@ -187,7 +196,9 @@ internal abstract class ConsumableHandle : SafeHandleZeroOrMinusOneIsInvalid
 
 internal sealed class LeaseHandle : ConsumableHandle
 {
-    internal LeaseHandle(nint value) : base(value) { }
+    internal LeaseHandle(nint value) : base(value)
+    {
+    }
 
     protected override bool ReleaseHandle()
     {

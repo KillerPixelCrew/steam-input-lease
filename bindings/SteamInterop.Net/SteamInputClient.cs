@@ -17,10 +17,18 @@ public sealed class SteamInputClient : IDisposable
     /// <exception cref="NotSupportedException">The loaded native DLL has an incompatible ABI.</exception>
     /// <exception cref="ArgumentException">An option contains an embedded NUL character.</exception>
     /// <exception cref="OverflowException">The timeout cannot be represented in milliseconds.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The connect timeout is zero or negative.</exception>
     public SteamInputClient(SteamInputClientOptions? options = null)
     {
         NativeMethods.EnsureCompatibleAbi();
         options ??= new SteamInputClientOptions();
+        if (options.ConnectTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                options.ConnectTimeout,
+                "The connect timeout must be positive; zero would become the native 10 second default.");
+        }
         if (options.TargetName.Contains('\0'))
         {
             throw new ArgumentException("The target name cannot contain a NUL character.", nameof(options));
@@ -37,7 +45,8 @@ public sealed class SteamInputClient : IDisposable
             {
                 TargetName = targetName,
                 PayloadPath = payloadPath,
-                ConnectTimeoutMilliseconds = checked((uint)options.ConnectTimeout.TotalMilliseconds),
+                // Rounded up: a sub-millisecond value would truncate to zero, the native default.
+                ConnectTimeoutMilliseconds = checked((uint)Math.Ceiling(options.ConnectTimeout.TotalMilliseconds)),
                 AllowInjection = options.AllowInjection ? 1u : 0u,
             };
             NativeMethods.ThrowIfFailed(

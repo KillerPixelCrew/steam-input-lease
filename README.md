@@ -609,7 +609,7 @@ if (!run.Release.RecoveryRequested)
 | Member | Notes |
 | --- | --- |
 | `SteamInputClient` | `IDisposable`; `Acquire`, `RunWrapped`, `EnsurePayload`, `GetStatus`, `Rescan`, `CheckRecovery` |
-| `SteamInputClientOptions` | `TargetName`, `PayloadPath`, `ConnectTimeout`, `AllowInjection` (all `init`; `AllowInjection` defaults to `false`) |
+| `SteamInputClientOptions` | `TargetName`, `PayloadPath`, `ConnectTimeout`, `AllowInjection` (all `init`; `AllowInjection` defaults to `false`; `ConnectTimeout` must be positive and is rounded up to whole milliseconds, because the native zero means the 10 s default) |
 | `SteamInputBlockLease` | `InitialStatus`, `Release()`, `Dispose()`; obtained only from `Acquire()` |
 | `SteamInputStatus` | `readonly record struct (ushort Capabilities, uint LeaseCount, uint HidHandleCount, uint LastRevokedHandleCount)` plus `SupportsInternalRecovery` |
 | `SteamControllerRescanResult` | `(double PreviousDeadline, uint ScanCountBefore, uint ScanCountAfter)` |

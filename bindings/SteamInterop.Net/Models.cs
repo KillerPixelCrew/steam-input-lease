@@ -21,6 +21,9 @@ public sealed class SteamInputClientOptions
     public string PayloadPath { get; init; } = Path.Combine(AppContext.BaseDirectory, "steam_input_gate.dll");
 
     /// <summary>Gets the maximum control-pipe startup wait.</summary>
+    /// <remarks>Must be positive, and is rounded up to whole milliseconds. The native API reads
+    /// zero as "use the 10 second default", so zero is refused rather than passed through as a
+    /// silently long wait.</remarks>
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
     /// <summary>Gets whether this client may inject the payload when no resident

@@ -180,7 +180,8 @@ SIL_API int32_t sil_client_acquire(
 /**
  * Explicitly releases and consumes @p lease, waits for the payload's release
  * and recovery-scheduling response, and writes @p outcome. The lease is
- * consumed even if this function returns an error.
+ * consumed even if this function returns an error, including a NULL
+ * @p outcome, which closes the lease without a report.
  */
 SIL_API int32_t sil_lease_release(
     SilLease* lease,

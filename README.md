@@ -550,8 +550,8 @@ populated) or `SIL_RECOVERY_UNAVAILABLE` (with a UTF-8 `recovery_message`). The 
 the struct because `sil_last_error_message()` reports failed calls only, and this call succeeded.
 
 Ownership: create one `SilClient*` and destroy it once. Consume each `SilLease*` exactly once.
-`sil_lease_release` consumes it even when it returns an error, except when it rejects a `NULL`
-argument before taking ownership. `sil_lease_destroy` is the non-reporting close path.
+`sil_lease_release` consumes it even when it returns an error, including a `NULL` `outcome`, which
+closes the lease without a report; only a `NULL` lease is left untouched. `sil_lease_destroy` is the non-reporting close path.
 
 Error lifetime: `sil_last_error_message()` returns a borrowed, NUL-terminated, thread-local pointer
 that is never `NULL`. Copy it before the next ABI call on that thread; a successful call also resets

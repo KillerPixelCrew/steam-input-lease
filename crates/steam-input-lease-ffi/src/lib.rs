@@ -434,19 +434,26 @@ pub unsafe extern "C" fn sil_client_acquire(
 /// `SIL_OK` means blocking was lifted; inspect `outcome->recovery` to learn
 /// whether Steam was also asked to rediscover controllers. The handle is
 /// consumed in every case, so callers must not subsequently pass it to
-/// [`sil_lease_destroy`].
+/// [`sil_lease_destroy`]. A null `outcome` is an error, but the lease is still
+/// consumed: its pipe is closed, which releases it without a report.
 ///
 /// # Safety
-/// `lease` must be a live, uniquely owned handle and `outcome` writable.
+/// `lease` must be null or a live, uniquely owned handle, and `outcome` null
+/// or writable.
 pub unsafe extern "C" fn sil_lease_release(
     lease: *mut SilLease,
     outcome: *mut SilReleaseOutcome,
 ) -> i32 {
     ffi_call(|| {
-        if lease.is_null() || outcome.is_null() {
-            return Err("lease handle or outcome output pointer was null".into());
+        if lease.is_null() {
+            return Err("lease handle was null".into());
         }
+        // Take ownership before validating the output pointer, so an error here still
+        // closes the pipe instead of holding Steam's controllers until the process exits.
         let mut lease = unsafe { Box::from_raw(lease) };
+        if outcome.is_null() {
+            return Err("outcome output pointer was null; the lease was closed without a report".into());
+        }
         let value = lease
             .0
             .take()
@@ -610,6 +617,17 @@ mod tests {
             .map(|&byte| byte as u8)
             .collect();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "before after");
+    }
+
+    #[test]
+    fn a_null_outcome_is_an_error_that_still_consumes_the_lease() {
+        // The handle is freed by the call; reusing it afterwards would be a double free, so the
+        // test only observes the documented error and message.
+        let lease = Box::into_raw(Box::new(SilLease(None)));
+        let result = unsafe { sil_lease_release(lease, std::ptr::null_mut()) };
+        assert_eq!(result, SIL_ERROR);
+        let message = unsafe { std::ffi::CStr::from_ptr(sil_last_error_message()) };
+        assert!(message.to_string_lossy().contains("closed without a report"));
     }
 
     #[test]

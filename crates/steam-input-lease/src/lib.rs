@@ -550,6 +550,31 @@ impl Client {
             Err(Error::PayloadUnavailable { .. }) => {}
             Err(error) => return Err(error),
         }
+        // The probe above only covers a 20ms no-pipe gap; the gate's own server can be
+        // without an instance for up to 250ms on a transient CreateNamedPipeW failure, and a
+        // payload with this exact file name can already be resident from launch options set
+        // while Management was off, before this process ever called inject_payload. Loading a
+        // second image under the same path when one is already resident by that name would
+        // give Steam two distinct images of the same code, each with its own LEASE_COUNT and
+        // its own detours re-hooking the same exports, so check residency by name first and
+        // give a resident payload the client's full configured timeout before injecting again.
+        if let Some(name) = self
+            .options
+            .payload_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            && remote_module(process_id, name).is_some()
+        {
+            return connect_pipe(process_id, self.options.connect_timeout).map_err(|error| {
+                match error {
+                    Error::PayloadUnavailable { source, .. } => Error::PayloadUnavailable {
+                        context: "a payload with this name is already loaded, but its control pipe did not become available",
+                        source,
+                    },
+                    other => other,
+                }
+            });
+        }
         if !self.options.payload_path.is_file() {
             return Err(Error::PayloadNotFound(self.options.payload_path.clone()));
         }

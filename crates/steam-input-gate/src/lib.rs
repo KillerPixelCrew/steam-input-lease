@@ -300,6 +300,9 @@ const RECOVERY_LAYOUT_MAX_ATTEMPTS: u32 = 4;
 static HID_THREAD_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static HID_THREAD_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 const HID_THREAD_MAX_ATTEMPTS: u32 = 3;
+// Guards the background capability resolver so a burst of QueryStatus replies while the cache is
+// stale schedules at most one sweep at a time instead of one per reply.
+static CAPABILITY_RESOLUTION_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Deadline shared with the rescan timer thread, and the condvar used to re-arm
 /// it. `None` deadline means idle.
@@ -1754,10 +1757,52 @@ fn resolve_discovery_deadline(ignore_budget: bool) -> Option<usize> {
     Some(hid_thread + runtime.layout.discovery_deadline_offset as usize)
 }
 
+// Whether the cached HID thread address is still valid, without any address-space sweep.
+//
+// Only a resolved layout and a still-valid cached address are cheap: both are a couple of atomic
+// or OnceLock reads plus the two vtable and one deadline read validate_hid_thread already does
+// to guard against a stale, reused address. Anything else means resolution has not completed, or
+// completed and failed, and answering that here would require the sweep this function exists to
+// avoid.
+fn cached_hid_thread_is_valid() -> bool {
+    let Some(runtime) = RECOVERY_LAYOUT.get() else {
+        return false;
+    };
+    let cached = HID_THREAD_ADDRESS.load(Ordering::Acquire);
+    cached != 0 && validate_hid_thread(runtime, cached)
+}
+
+// Resolves the HID thread off the pipe worker so a stale cache does not cost every reply a full
+// address-space sweep and, on an unrecognised build, up to a 1.5 s live-object election.
+//
+// resolve_discovery_deadline already bounds its own attempts and is safe to call from more than
+// one thread at once (runtime_recovery_layout's own comment above covers the race), so this only
+// needs to avoid piling up redundant sweeps while one is already in flight; it does not change what
+// gets resolved or how many real attempts are spent, only which thread pays for them.
+fn schedule_capability_resolution() {
+    if CAPABILITY_RESOLUTION_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // A spawn failure just means the next reply with a stale cache tries again; there is
+        // nothing else to report it to and nothing was left half-done.
+        let spawned = thread::Builder::new()
+            .name("steam-input-gate-capabilities".into())
+            .spawn(|| {
+                let _ = resolve_discovery_deadline(false);
+                CAPABILITY_RESOLUTION_RUNNING.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            CAPABILITY_RESOLUTION_RUNNING.store(false, Ordering::Release);
+        }
+    }
+}
+
 fn payload_capabilities() -> u16 {
-    let recovery = if resolve_discovery_deadline(false).is_some() {
+    let recovery = if cached_hid_thread_is_valid() {
         CAPABILITY_INTERNAL_RECOVERY
     } else {
+        schedule_capability_resolution();
         0
     };
     recovery | CAPABILITY_PASS_THROUGH | if PASS_THROUGH_COUNT.load(Ordering::Acquire) > 0 {

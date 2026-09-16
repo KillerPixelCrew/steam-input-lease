@@ -1047,7 +1047,9 @@ unsafe fn find_remote_hid_thread(
                     .min(region_end);
                 let length = chunk_end - chunk_start;
                 let mut transferred = 0;
-                if unsafe {
+                // A partial copy returns FALSE with `transferred` still set, and those
+                // bytes are as valid as a full read's, so the result is not a gate.
+                let _ = unsafe {
                     ReadProcessMemory(
                         process,
                         chunk_start as *const c_void,
@@ -1055,25 +1057,35 @@ unsafe fn find_remote_hid_thread(
                         length,
                         &mut transferred,
                     )
-                } != FALSE
-                {
-                    // Only the bytes this read actually delivered may be
-                    // matched. Everything past `transferred` is still the
-                    // previous chunk's contents, and a candidate manufactured
-                    // from that stale data would be an address this code later
-                    // hands to WriteProcessMemory inside Steam.
-                    candidates.extend(find_vtable_pairs(
-                        &buffer[..transferred],
-                        chunk_start,
-                        primary,
-                        secondary,
-                        layout.secondary_object_offset as usize,
-                    ));
+                };
+                // Never trust the count past the request; slicing beyond the buffer would
+                // panic, which inside Steam is a crash.
+                let transferred = transferred.min(length);
+                // Only the bytes this read actually delivered may be
+                // matched. Everything past `transferred` is still the
+                // previous chunk's contents, and a candidate manufactured
+                // from that stale data would be an address this code later
+                // hands to WriteProcessMemory inside Steam.
+                candidates.extend(find_vtable_pairs(
+                    &buffer[..transferred],
+                    chunk_start,
+                    primary,
+                    secondary,
+                    layout.secondary_object_offset as usize,
+                ));
+                // ReadProcessMemory reports a partial copy as failure but still sets
+                // `transferred`, so those bytes were matched above; continue past the
+                // unreadable page rather than skipping the rest of the chunk.
+                match steam_input_recovery::next_scan_start(
+                    chunk_start,
+                    chunk_end,
+                    region_end,
+                    transferred,
+                    pair_size.saturating_sub(1),
+                ) {
+                    Some(next) => chunk_start = next,
+                    None => break,
                 }
-                if chunk_end == region_end {
-                    break;
-                }
-                chunk_start = chunk_end.saturating_sub(pair_size.saturating_sub(1));
             }
         }
         if region_end <= address {

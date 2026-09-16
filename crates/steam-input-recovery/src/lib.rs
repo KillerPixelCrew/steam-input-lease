@@ -294,6 +294,37 @@ pub fn find_vtable_pairs(
     addresses
 }
 
+/// Page size assumed when stepping over an unreadable page during a scan.
+pub const SCAN_PAGE_SIZE: usize = 0x1000;
+
+/// Returns where a chunked scan of `[.., region_end)` continues after reading
+/// `[chunk_start, chunk_end)`, or `None` when the region is finished.
+///
+/// A complete read continues `overlap` bytes before `chunk_end`, so a pattern
+/// that straddles two chunks is still seen. A short read (`transferred` less
+/// than the chunk) stopped at the first unreadable page; the scan resumes at the
+/// page after it, so the readable remainder of the chunk is still examined
+/// instead of being skipped with the rest of the chunk. A pattern cannot straddle
+/// an unreadable page, so no overlap is needed there.
+#[must_use]
+pub fn next_scan_start(
+    chunk_start: usize,
+    chunk_end: usize,
+    region_end: usize,
+    transferred: usize,
+    overlap: usize,
+) -> Option<usize> {
+    let next = if transferred < chunk_end - chunk_start {
+        let failed_at = chunk_start + transferred;
+        (failed_at / SCAN_PAGE_SIZE + 1).saturating_mul(SCAN_PAGE_SIZE)
+    } else if chunk_end >= region_end {
+        return None;
+    } else {
+        chunk_end.saturating_sub(overlap).max(chunk_start + 1)
+    };
+    (next < region_end).then_some(next)
+}
+
 /// Resolves controller recovery from a snapshot of a *loaded* PE image.
 ///
 /// `module_base` must be the runtime base represented by absolute pointers in
@@ -787,6 +818,41 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         bytes.get(offset..offset + 8)?.try_into().ok()?,
     ))
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::{SCAN_PAGE_SIZE, next_scan_start};
+
+    #[test]
+    fn a_complete_read_overlaps_into_the_next_chunk() {
+        assert_eq!(next_scan_start(0x10000, 0x20000, 0x40000, 0x10000, 15), Some(0x20000 - 15));
+    }
+
+    #[test]
+    fn a_complete_read_of_the_last_chunk_ends_the_region() {
+        assert_eq!(next_scan_start(0x30000, 0x40000, 0x40000, 0x10000, 15), None);
+    }
+
+    #[test]
+    fn a_short_read_resumes_after_the_unreadable_page_instead_of_skipping_the_chunk() {
+        let start = 0x10000;
+        let transferred = 3 * SCAN_PAGE_SIZE;
+        assert_eq!(
+            next_scan_start(start, 0x20000, 0x40000, transferred, 15),
+            Some(start + transferred + SCAN_PAGE_SIZE)
+        );
+    }
+
+    #[test]
+    fn a_failed_read_steps_one_page() {
+        assert_eq!(next_scan_start(0x10000, 0x20000, 0x40000, 0, 15), Some(0x11000));
+    }
+
+    #[test]
+    fn a_short_read_near_the_region_end_finishes() {
+        assert_eq!(next_scan_start(0x3F000, 0x40000, 0x40000, 0, 15), None);
+    }
 }
 
 #[cfg(test)]

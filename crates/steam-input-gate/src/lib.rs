@@ -38,8 +38,9 @@ use steam_input_lease_core::{
     Command, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response, ResultCode,
 };
 use steam_input_recovery::{
-    Election, RecoveryLayout, SchedulerSample, elect_progressing_candidate, find_vtable_pairs,
-    memory_is_readable, resolve_recovery_layout,
+    Election, MemoryRegion, ProcessMemory, RecoveryLayout, SECOND_DISCOVERY_DELAY,
+    elect_running_hid_thread, find_live_hid_threads, hid_thread_is_live, memory_is_readable,
+    resolve_recovery_layout,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes};
 use windows_sys::Win32::Foundation::{
@@ -66,7 +67,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
     GetProcAddress,
 };
-use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -86,7 +87,7 @@ use proxy::{Vector, classify_vector, initialize_forwarding, record_self_module};
 use startup_trace::StartupTrace;
 
 // Win32/NT constants that windows-sys does not expose through the selected API
-// surface. Values come from the Windows SDK headers used by the archived POC.
+// surface. Values come from the Windows SDK headers.
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
 const DBT_DEVICEARRIVAL: usize = 0x8000;
@@ -124,7 +125,6 @@ const _: () = assert!(size_of::<DeviceBroadcastHeader>() == 12);
 const SDL_DEVICE_CHANGE_TIMEOUT_MS: u32 = 2_000;
 
 const MODULE_SNAPSHOT_LIMIT: usize = 512 * 1024 * 1024;
-const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
 const HANDLE_QUERY_LIMIT: usize = 256 * 1024 * 1024;
 
 // Minimal NT structure layouts required by the native Nt* hooks and system
@@ -310,7 +310,6 @@ type RescanTimer = (Mutex<Option<Instant>>, Condvar);
 
 static RESCAN_TIMER: OnceLock<&'static RescanTimer> = OnceLock::new();
 static RESCAN_TIMER_STARTED: AtomicBool = AtomicBool::new(false);
-const SECOND_DISCOVERY_DELAY: Duration = Duration::from_millis(2200);
 
 // Consecutive CreateNamedPipeW failures the control server tolerates before it
 // gives up, and the pause between attempts.
@@ -1586,22 +1585,49 @@ fn runtime_recovery_layout(ignore_budget: bool) -> Option<&'static RuntimeRecove
     }
 }
 
-fn validate_hid_thread(runtime: &RuntimeRecoveryLayout, address: usize) -> bool {
-    if address == 0 {
-        return false;
-    }
-    unsafe {
-        let primary = read_current::<usize>(address);
-        let secondary =
-            read_current::<usize>(address + runtime.layout.secondary_object_offset as usize);
-        let deadline =
-            read_current::<f64>(address + runtime.layout.discovery_deadline_offset as usize);
-        primary == Some(runtime.module_base + runtime.layout.primary_vtable_rva as usize)
-            && secondary == Some(runtime.module_base + runtime.layout.secondary_vtable_rva as usize)
-            && deadline.is_some_and(|value| {
-                value.is_finite() && (value == -1.0 || (0.0..1.0e12).contains(&value))
+/// The payload's own address space, read through `ReadProcessMemory` rather
+/// than dereferenced, so an object freed under a scan only shortens a read.
+struct CurrentProcess;
+
+impl ProcessMemory for CurrentProcess {
+    fn query(&self, address: usize) -> Option<MemoryRegion> {
+        let mut memory: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+        (unsafe {
+            VirtualQuery(
+                address as *const c_void,
+                &mut memory,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0)
+            .then_some(MemoryRegion {
+                base: memory.BaseAddress as usize,
+                size: memory.RegionSize,
+                state: memory.State,
+                protect: memory.Protect,
+                kind: memory.Type,
             })
     }
+
+    fn read(&self, address: usize, buffer: &mut [u8]) -> usize {
+        let mut transferred = 0;
+        // A partial copy returns FALSE with `transferred` still set, and those
+        // bytes are as valid as a full read's, so the result is not a gate.
+        let _ = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                address as *const c_void,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut transferred,
+            )
+        };
+        transferred
+    }
+}
+
+fn validate_hid_thread(runtime: &RuntimeRecoveryLayout, address: usize) -> bool {
+    address != 0
+        && hid_thread_is_live(&CurrentProcess, runtime.module_base, &runtime.layout, address)
 }
 
 fn find_hid_thread(runtime: &RuntimeRecoveryLayout, ignore_budget: bool) -> Option<usize> {
@@ -1620,88 +1646,23 @@ fn find_hid_thread(runtime: &RuntimeRecoveryLayout, ignore_budget: bool) -> Opti
         return None;
     }
 
-    let secondary_offset = runtime.layout.secondary_object_offset as usize;
-    let primary = runtime.module_base + runtime.layout.primary_vtable_rva as usize;
-    let secondary = runtime.module_base + runtime.layout.secondary_vtable_rva as usize;
-    let pair_size = secondary_offset + size_of::<usize>();
-    let mut candidates = Vec::new();
-    // One reused buffer instead of a fresh zeroed Vec per chunk. Every scan MUST
-    // slice to `transferred`: stale bytes from a previous, larger chunk live past
-    // a short read, and letting the matcher see them could manufacture a false
-    // candidate at a bogus address, defeating the "exactly one candidate" check
-    // and naming a wrong address for the -1.0 store.
-    let mut buffer = vec![0u8; PROCESS_SCAN_CHUNK];
-    let mut address = 0x1_0000usize;
-    while address < usize::MAX / 2 {
-        let mut memory: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
-        if unsafe {
-            VirtualQuery(
-                address as *const c_void,
-                &mut memory,
-                size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        } == 0
-        {
-            break;
-        }
-        let region_start = memory.BaseAddress as usize;
-        let region_end = region_start.saturating_add(memory.RegionSize);
-        if memory_is_readable(memory.State, memory.Protect) && memory.Type == MEM_PRIVATE {
-            let mut chunk_start = region_start;
-            while chunk_start < region_end {
-                let chunk_end = chunk_start
-                    .saturating_add(PROCESS_SCAN_CHUNK)
-                    .min(region_end);
-                let length = chunk_end - chunk_start;
-                let mut transferred = 0;
-                // A partial copy returns FALSE with `transferred` still set, and those
-                // bytes are as valid as a full read's, so the result is not a gate.
-                let _ = unsafe {
-                    ReadProcessMemory(
-                        GetCurrentProcess(),
-                        chunk_start as *const c_void,
-                        buffer.as_mut_ptr().cast(),
-                        length,
-                        &mut transferred,
-                    )
-                };
-                // Never trust the count past the request; slicing beyond the buffer would
-                // panic, which inside Steam is a crash.
-                let transferred = transferred.min(length);
-                candidates.extend(find_vtable_pairs(
-                    &buffer[..transferred],
-                    chunk_start,
-                    primary,
-                    secondary,
-                    secondary_offset,
-                ));
-                // ReadProcessMemory reports a partial copy as failure but still sets
-                // `transferred`, so those bytes were matched above; continue past the
-                // unreadable page rather than skipping the rest of the chunk.
-                match steam_input_recovery::next_scan_start(
-                    chunk_start,
-                    chunk_end,
-                    region_end,
-                    transferred,
-                    pair_size.saturating_sub(1),
-                ) {
-                    Some(next) => chunk_start = next,
-                    None => break,
-                }
-            }
-        }
-        if region_end <= address {
-            break;
-        }
-        address = region_end;
-    }
-    candidates.retain(|&candidate| validate_hid_thread(runtime, candidate));
-    candidates.sort_unstable();
-    candidates.dedup();
+    let candidates = find_live_hid_threads(&CurrentProcess, runtime.module_base, &runtime.layout);
     let elected = match candidates.as_slice() {
         [address] => Some(*address),
         [] => None,
-        several => elect_running_hid_thread(runtime, several),
+        // The nudge is the same device-change notification used as the
+        // unknown-build fallback.
+        several => match elect_running_hid_thread(
+            &CurrentProcess,
+            &runtime.layout,
+            several,
+            || {
+                unsafe { EnumWindows(Some(notify_window), 0) };
+            },
+        ) {
+            Election::Elected(index) => Some(several[index]),
+            Election::Unreadable | Election::Ambiguous { .. } => None,
+        },
     };
     if let Some(address) = elected {
         HID_THREAD_ADDRESS.store(address, Ordering::Release);
@@ -1711,56 +1672,6 @@ fn find_hid_thread(runtime: &RuntimeRecoveryLayout, ignore_budget: bool) -> Opti
         HID_THREAD_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
         None
     }
-}
-
-/// Separates the running HID thread from abandoned look-alikes by watching
-/// which candidate keeps scheduling discovery.
-///
-/// Revoking Steam's HID handles makes it rebuild its HID thread, and the freed
-/// block keeps the class vtables and a plausible deadline until the allocator
-/// reuses that memory. The copy is structurally a valid object, so only
-/// movement in the scheduler fields tells the two apart. Steam is nudged with
-/// the same device-change notification used as the unknown-build fallback so
-/// the live thread has a reason to reschedule promptly.
-///
-/// Returns `None` unless exactly one candidate moves, which keeps the caller
-/// fail-closed: this address later receives the deadline store.
-fn elect_running_hid_thread(
-    runtime: &RuntimeRecoveryLayout,
-    candidates: &[usize],
-) -> Option<usize> {
-    match elect_progressing_candidate(
-        || sample_candidates(runtime, candidates),
-        || {
-            unsafe { EnumWindows(Some(notify_window), 0) };
-        },
-    ) {
-        Election::Elected(index) => Some(candidates[index]),
-        Election::Unreadable | Election::Ambiguous { .. } => None,
-    }
-}
-
-/// Reads the scheduler fields of every candidate. A candidate that cannot be
-/// read abandons the election: an unreadable address must never be mistaken for
-/// one that merely stood still.
-fn sample_candidates(
-    runtime: &RuntimeRecoveryLayout,
-    candidates: &[usize],
-) -> Option<Vec<SchedulerSample>> {
-    candidates
-        .iter()
-        .map(|&candidate| unsafe {
-            Some(SchedulerSample {
-                deadline_bits: read_current::<f64>(
-                    candidate + runtime.layout.discovery_deadline_offset as usize,
-                )?
-                .to_bits(),
-                counter: read_current::<u32>(
-                    candidate + runtime.layout.discovery_counter_offset as usize,
-                )?,
-            })
-        })
-        .collect()
 }
 
 fn resolve_discovery_deadline(ignore_budget: bool) -> Option<usize> {

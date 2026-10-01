@@ -360,8 +360,12 @@ controllers are actually back. The payload issues a required follow-up discovery
 seconds later on its own timer thread, so a caller that enumerates immediately may still see nothing
 for roughly a second. The caller does not wait for it.
 
-The exception is a legacy payload that does not advertise `CAPABILITY_INTERNAL_RECOVERY`. There the
-host runs the two-pass recovery itself, and `release()` blocks for roughly 4.5 seconds.
+The exception is a release of the last block lease whose response lacks
+`CAPABILITY_INTERNAL_RECOVERY`. The payload advertises it only while it holds a validated address for
+Steam's HID thread, so a payload that could not locate or elect that thread leaves it out. The host
+then runs the two-pass recovery itself, and `release()` blocks for roughly 4.5 seconds. A release
+that leaves other block leases in place needs no recovery, just as the payload rescans only when
+blocking ends.
 
 ## Rust
 
@@ -455,7 +459,7 @@ runs, and a recovery failure must not present a released lease as a failed one.
 
 | `RecoveryOutcome` | Meaning |
 | --- | --- |
-| `NotRequired` | The target is not Steam |
+| `NotRequired` | The target is not Steam, or other block leases remain |
 | `Scheduled` | The payload will schedule discovery on its own timer |
 | `Completed(RescanResult)` | The host ran guarded two-pass recovery inline |
 | `Unavailable(Error)` | Recovery could not run; blocking was still lifted |
@@ -879,8 +883,8 @@ loaded pinned payload cannot be converted into a safely unloadable one in place.
 - A substantial Valve refactor can still break recovery: stripping RTTI, renaming or replacing
   `CHIDIOThread`, changing its inheritance, or rewriting the scheduler so the validated instruction
   semantics disappear.
-- Protocol version `1` stays compatible with older payloads. One that does not advertise internal
-  recovery triggers host-side recovery on explicit release.
+- A release response that does not advertise internal recovery, from a payload that holds no
+  validated HID-thread address, triggers host-side recovery on explicit release.
 
 When Valve changes something structural, fix the semantic resolver rather than adding a
 build-specific offset profile. Check both that the scan counter advances and that a real block and

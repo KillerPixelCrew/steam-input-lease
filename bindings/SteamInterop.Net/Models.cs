@@ -89,7 +89,7 @@ public readonly record struct SteamControllerRescanResult(
 /// </summary>
 public enum SteamControllerRecovery
 {
-    /// <summary>The target is not Steam, so no controller recovery applies.</summary>
+    /// <summary>The target is not Steam, or other block leases remain, so no controller recovery applies.</summary>
     NotRequired = 0,
 
     /// <summary>

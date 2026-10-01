@@ -1,9 +1,9 @@
 //! Shared wire protocol between the controller library and injected payload.
 //!
 //! The protocol intentionally consists only of fixed-width `#[repr(C)]`
-//! structures. This keeps the Rust host, Rust payload, archived C++ proof of
-//! concept, and C ABI interoperable. Numeric command/result fields are used on
-//! the wire so malformed input cannot create an invalid Rust enum discriminant.
+//! structures. This keeps the Rust host, Rust payload, and C ABI interoperable.
+//! Numeric command/result fields are used on the wire so malformed input cannot
+//! create an invalid Rust enum discriminant.
 
 #![deny(missing_docs)]
 
@@ -131,7 +131,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_layout_remains_compatible_with_cpp_poc() {
+    fn protocol_layout_is_stable() {
         assert_eq!(size_of::<Request>(), 8);
         assert_eq!(size_of::<Response>(), 24);
     }

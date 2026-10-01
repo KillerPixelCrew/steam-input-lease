@@ -10,12 +10,12 @@
 //!
 //! This crate only analyzes caller-supplied snapshots and readings, and contains
 //! no Win32 calls of its own. [`resolve_recovery_layout`] derives the layout
-//! from an image snapshot, [`find_vtable_pairs`] matches that layout against a
-//! snapshot of live memory, and [`elect_progressing_candidate`] times the
-//! live-object election over caller-supplied reads; enumerating regions,
-//! reading either process, and writing the result are kept in the host and
-//! payload crates, where the appropriate Win32 APIs and ownership rules are
-//! known.
+//! from an image snapshot, [`find_live_hid_threads`] scans live memory for the
+//! objects carrying it, and [`elect_running_hid_thread`] picks the running one
+//! when several survive. The host and the payload run the same scan and
+//! election; each supplies only a [`ProcessMemory`] reader for its view of
+//! Steam, and keeps writing the result to itself, where the appropriate Win32
+//! APIs and ownership rules are known.
 
 #![deny(missing_docs)]
 // clippy 1.98 added `chunks_exact_to_as_chunks`, which fires on the three 8-byte
@@ -166,9 +166,10 @@ pub fn select_progressing_candidate(
     progressing
 }
 
-// Win32 MEM_COMMIT, PAGE_NOACCESS and PAGE_GUARD. This crate has no windows-sys
-// dependency, so the documented SDK values are spelled out here.
+// Win32 MEM_COMMIT, MEM_PRIVATE, PAGE_NOACCESS and PAGE_GUARD. This crate has no
+// windows-sys dependency, so the documented SDK values are spelled out here.
 const MEM_COMMIT: u32 = 0x1000;
+const MEM_PRIVATE: u32 = 0x2_0000;
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_GUARD: u32 = 0x100;
 
@@ -189,6 +190,202 @@ pub const fn memory_is_readable(state: u32, protect: u32) -> bool {
 // fail-closed answer it replaced.
 const LIVE_ELECTION_TIMEOUT: Duration = Duration::from_millis(1500);
 const LIVE_ELECTION_INTERVAL: Duration = Duration::from_millis(125);
+
+/// Spacing between the two discovery requests of one recovery.
+///
+/// The second request must land after Steam's queued zombie-controller cleanup,
+/// which the first request can trigger, so the post-cleanup state is durable.
+pub const SECOND_DISCOVERY_DELAY: Duration = Duration::from_millis(2200);
+
+// Bytes requested per read while scanning private memory for live objects.
+const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
+
+/// One region of a process's address space, as `VirtualQuery` reports it in
+/// `MEMORY_BASIC_INFORMATION`.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryRegion {
+    /// `BaseAddress`, where the region begins.
+    pub base: usize,
+    /// `RegionSize`, the region's length in bytes.
+    pub size: usize,
+    /// `State`, such as `MEM_COMMIT`.
+    pub state: u32,
+    /// `Protect`, the region's page protection.
+    pub protect: u32,
+    /// `Type`, such as `MEM_PRIVATE`.
+    pub kind: u32,
+}
+
+/// Read access to one process's memory: the payload's own, or Steam's through
+/// a host process handle.
+///
+/// The live-object scan and election are the same on both sides; only how they
+/// reach Steam's memory differs, and that is all an implementation supplies.
+pub trait ProcessMemory {
+    /// Describes the region containing `address`, or `None` when the query
+    /// fails, which ends a scan.
+    fn query(&self, address: usize) -> Option<MemoryRegion>;
+
+    /// Copies up to `buffer.len()` bytes from `address` and returns how many
+    /// were copied. A partial copy stops at the first unreadable page, and the
+    /// bytes it delivered are as valid as a full read's.
+    fn read(&self, address: usize, buffer: &mut [u8]) -> usize;
+}
+
+fn read_exact<const N: usize>(memory: &impl ProcessMemory, address: usize) -> Option<[u8; N]> {
+    let mut bytes = [0u8; N];
+    (memory.read(address, &mut bytes) == N).then_some(bytes)
+}
+
+fn read_pointer(memory: &impl ProcessMemory, address: usize) -> Option<usize> {
+    read_exact(memory, address).map(usize::from_ne_bytes)
+}
+
+/// Single definition of "this address still holds Steam's live `CHIDIOThread`"
+/// for `layout` loaded at `module_base`.
+///
+/// Both embedded vtable slots must match the resolved pair, and the deadline
+/// field must read as a plausible scheduling value; anything else means the
+/// object was freed and its storage reused.
+#[must_use]
+pub fn hid_thread_is_live(
+    memory: &impl ProcessMemory,
+    module_base: usize,
+    layout: &RecoveryLayout,
+    address: usize,
+) -> bool {
+    let primary = module_base + layout.primary_vtable_rva as usize;
+    let secondary = module_base + layout.secondary_vtable_rva as usize;
+    read_pointer(memory, address) == Some(primary)
+        && read_pointer(memory, address + layout.secondary_object_offset as usize)
+            == Some(secondary)
+        && read_exact(memory, address + layout.discovery_deadline_offset as usize)
+            .map(f64::from_ne_bytes)
+            .is_some_and(|value| {
+                value.is_finite() && (value == -1.0 || (0.0..1.0e12).contains(&value))
+            })
+}
+
+/// Scans the private memory of `memory` for live `CHIDIOThread` objects of
+/// `layout` loaded at `module_base`, returning their addresses sorted and
+/// without duplicates.
+///
+/// More than one address can survive; [`elect_running_hid_thread`] separates
+/// them. Reads never dereference: an object freed under the scan only shortens
+/// a read.
+#[must_use]
+pub fn find_live_hid_threads(
+    memory: &impl ProcessMemory,
+    module_base: usize,
+    layout: &RecoveryLayout,
+) -> Vec<usize> {
+    let secondary_offset = layout.secondary_object_offset as usize;
+    let primary = module_base + layout.primary_vtable_rva as usize;
+    let secondary = module_base + layout.secondary_vtable_rva as usize;
+    let pair_size = secondary_offset + size_of::<usize>();
+    let mut candidates = Vec::new();
+    // One reused buffer instead of a fresh zeroed Vec per chunk. Every scan MUST
+    // slice to `transferred`: stale bytes from a previous, larger chunk live past
+    // a short read, and letting the matcher see them could manufacture a false
+    // candidate at a bogus address, defeating the "exactly one candidate" check
+    // and naming a wrong address for the -1.0 store.
+    let mut buffer = vec![0u8; PROCESS_SCAN_CHUNK];
+    let mut address = 0x1_0000usize;
+    while address < usize::MAX / 2 {
+        let Some(region) = memory.query(address) else {
+            break;
+        };
+        let region_start = region.base;
+        let region_end = region_start.saturating_add(region.size);
+        if memory_is_readable(region.state, region.protect) && region.kind == MEM_PRIVATE {
+            let mut chunk_start = region_start;
+            while chunk_start < region_end {
+                let chunk_end = chunk_start
+                    .saturating_add(PROCESS_SCAN_CHUNK)
+                    .min(region_end);
+                let length = chunk_end - chunk_start;
+                // Never trust the count past the request; slicing beyond the buffer would
+                // panic, which inside Steam is a crash.
+                let transferred = memory
+                    .read(chunk_start, &mut buffer[..length])
+                    .min(length);
+                candidates.extend(find_vtable_pairs(
+                    &buffer[..transferred],
+                    chunk_start,
+                    primary,
+                    secondary,
+                    secondary_offset,
+                ));
+                // A partial copy still delivered `transferred` bytes, which were
+                // matched above; continue past the unreadable page rather than
+                // skipping the rest of the chunk.
+                match next_scan_start(
+                    chunk_start,
+                    chunk_end,
+                    region_end,
+                    transferred,
+                    pair_size.saturating_sub(1),
+                ) {
+                    Some(next) => chunk_start = next,
+                    None => break,
+                }
+            }
+        }
+        if region_end <= address {
+            break;
+        }
+        address = region_end;
+    }
+    candidates.retain(|&candidate| hid_thread_is_live(memory, module_base, layout, candidate));
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+/// Separates the running HID thread from abandoned look-alikes by watching
+/// which of `candidates` keeps scheduling discovery.
+///
+/// Revoking Steam's HID handles makes it tear its HID thread down and build a
+/// new one, and the freed block keeps the class vtables and a plausible
+/// deadline until the allocator hands that memory out again. The copy is
+/// structurally a valid object, so only movement in the scheduler fields tells
+/// the two apart. `nudge` should post Steam the device-change notification used
+/// as the unknown-build fallback, so the live thread has a reason to reschedule
+/// promptly.
+///
+/// A candidate that cannot be read abandons the election: an unreadable address
+/// must never be mistaken for one that merely stood still. Nothing is written,
+/// and only [`Election::Elected`] names a candidate, whose address later
+/// receives the deadline store.
+pub fn elect_running_hid_thread(
+    memory: &impl ProcessMemory,
+    layout: &RecoveryLayout,
+    candidates: &[usize],
+    nudge: impl FnOnce(),
+) -> Election {
+    let deadline_offset = layout.discovery_deadline_offset as usize;
+    let counter_offset = layout.discovery_counter_offset as usize;
+    elect_progressing_candidate(
+        || {
+            candidates
+                .iter()
+                .map(|&candidate| {
+                    Some(SchedulerSample {
+                        deadline_bits: u64::from_ne_bytes(read_exact(
+                            memory,
+                            candidate + deadline_offset,
+                        )?),
+                        counter: u32::from_ne_bytes(read_exact(
+                            memory,
+                            candidate + counter_offset,
+                        )?),
+                    })
+                })
+                .collect()
+        },
+        nudge,
+    )
+}
 
 /// Outcome of [`elect_progressing_candidate`].
 #[derive(Clone, Debug, Eq, PartialEq)]

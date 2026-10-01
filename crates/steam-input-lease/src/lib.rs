@@ -13,9 +13,10 @@
 //! the crash-safe release path; [`Lease::release`] additionally waits for an
 //! explicit response. A payload advertising
 //! [`CAPABILITY_INTERNAL_RECOVERY`] schedules the follow-up discovery request on
-//! its own timer, so release returns before controllers reappear. Only a legacy
-//! payload without that capability makes release run the guarded two-pass
-//! recovery inline, which takes several seconds.
+//! its own timer, so release returns before controllers reappear. The payload
+//! advertises it only while it holds a validated address for Steam's HID thread;
+//! when the release response lacks it, release falls back to running the
+//! guarded two-pass recovery inline from the host, which takes several seconds.
 //!
 //! # Platform and compatibility
 //!
@@ -43,8 +44,9 @@ use std::time::{Duration, Instant};
 
 use steam_input_lease_core::{Command, Request, Response};
 use steam_input_recovery::{
-    Election, RecoveryLayout, SchedulerSample, elect_progressing_candidate, find_vtable_pairs,
-    memory_is_readable, resolve_recovery_layout,
+    Election, MemoryRegion, ProcessMemory, RecoveryLayout, SECOND_DISCOVERY_DELAY, SchedulerSample,
+    elect_running_hid_thread, find_live_hid_threads, hid_thread_is_live, memory_is_readable,
+    resolve_recovery_layout,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BAD_LENGTH, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PIPE_BUSY,
@@ -70,7 +72,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
     VirtualAllocEx, VirtualFreeEx, VirtualQueryEx,
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
@@ -89,7 +91,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub use steam_input_lease_core::CAPABILITY_INTERNAL_RECOVERY;
 
 const MODULE_SNAPSHOT_LIMIT: usize = 512 * 1024 * 1024;
-const PROCESS_SCAN_CHUNK: usize = 1024 * 1024;
 
 // Bounded retries for a toolhelp module snapshot taken while Steam's loader
 // list is changing, and the linearly increasing pause between them.
@@ -185,7 +186,9 @@ pub struct RescanResult {
 /// release behind an error, so it is carried here instead.
 #[derive(Debug)]
 pub enum RecoveryOutcome {
-    /// The target is not Steam, so no controller recovery applies.
+    /// No controller recovery applies to this release: the target is not Steam,
+    /// or other block leases remain, so Steam either stays blocked or already
+    /// reads controllers through an active pass-through claim.
     NotRequired,
     /// The payload advertises internal recovery and scheduled discovery on its
     /// own timer. Controllers reappear shortly after release returns.
@@ -619,9 +622,12 @@ impl Lease {
     /// enumerates controllers immediately may therefore still observe none for
     /// roughly a second.
     ///
-    /// For legacy payloads without internal recovery capability, the host runs
-    /// the same guarded two-pass recovery before returning, which blocks the
-    /// caller for roughly four and a half seconds. Dropping the lease
+    /// When this was the last block lease and the release response does not
+    /// advertise internal recovery, because the payload holds no validated
+    /// HID-thread address, the host runs the same guarded two-pass recovery
+    /// before returning, which blocks the caller for roughly four and a half
+    /// seconds. While other block leases remain, no recovery applies, as the
+    /// payload itself only rescans when blocking ends. Dropping the lease
     /// without calling this method still closes the pipe and releases blocking,
     /// which remains the crash-safe path, but reports neither status nor
     /// recovery outcome.
@@ -638,7 +644,7 @@ impl Lease {
         let response = exchange(pipe.raw(), Command::ReleaseLease);
         drop(pipe);
         let response = response?;
-        let recovery = if !self.target_is_steam {
+        let recovery = if !self.target_is_steam || response.lease_count > 0 {
             RecoveryOutcome::NotRequired
         } else if response.has_internal_recovery() {
             RecoveryOutcome::Scheduled
@@ -918,47 +924,57 @@ unsafe fn read_remote<T: Copy>(process: HANDLE, address: usize) -> Result<T> {
 struct RemoteRecoveryTarget {
     process: OwnedHandle,
     hid_thread: usize,
-    deadline_offset: usize,
-    counter_offset: usize,
-    primary_vtable: usize,
-    secondary_vtable: usize,
-    secondary_object_offset: usize,
+    module_base: usize,
+    layout: RecoveryLayout,
 }
 
-/// Single definition of "the resolved address still holds Steam's live
-/// `CHIDIOThread`". Both embedded vtable slots must still match the pair the
-/// address was identified by, and the deadline field must still read as a
-/// plausible scheduling value; anything else means the object was freed and its
-/// storage reused.
-unsafe fn hid_thread_is_live(
-    process: HANDLE,
-    hid_thread: usize,
-    primary_vtable: usize,
-    secondary_vtable: usize,
-    secondary_object_offset: usize,
-    deadline_offset: usize,
-) -> bool {
-    unsafe {
-        read_remote::<usize>(process, hid_thread).is_ok_and(|value| value == primary_vtable)
-            && read_remote::<usize>(process, hid_thread + secondary_object_offset)
-                .is_ok_and(|value| value == secondary_vtable)
-            && read_remote::<f64>(process, hid_thread + deadline_offset).is_ok_and(|value| {
-                value.is_finite() && (value == -1.0 || (0.0..1.0e12).contains(&value))
+/// Steam's address space through a host process handle opened for reading.
+struct RemoteMemory(HANDLE);
+
+impl ProcessMemory for RemoteMemory {
+    fn query(&self, address: usize) -> Option<MemoryRegion> {
+        let mut memory: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+        (unsafe {
+            VirtualQueryEx(
+                self.0,
+                address as *const c_void,
+                &mut memory,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0)
+            .then_some(MemoryRegion {
+                base: memory.BaseAddress as usize,
+                size: memory.RegionSize,
+                state: memory.State,
+                protect: memory.Protect,
+                kind: memory.Type,
             })
+    }
+
+    fn read(&self, address: usize, buffer: &mut [u8]) -> usize {
+        let mut transferred = 0;
+        // A partial copy returns FALSE with `transferred` still set, and those
+        // bytes are as valid as a full read's, so the result is not a gate.
+        let _ = unsafe {
+            ReadProcessMemory(
+                self.0,
+                address as *const c_void,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut transferred,
+            )
+        };
+        transferred
     }
 }
 
 fn validate_remote_hid_thread(target: &RemoteRecoveryTarget) -> bool {
-    unsafe {
-        hid_thread_is_live(
-            target.process.raw(),
-            target.hid_thread,
-            target.primary_vtable,
-            target.secondary_vtable,
-            target.secondary_object_offset,
-            target.deadline_offset,
-        )
-    }
+    hid_thread_is_live(
+        &RemoteMemory(target.process.raw()),
+        target.module_base,
+        &target.layout,
+        target.hid_thread,
+    )
 }
 
 unsafe fn snapshot_remote_module(process: HANDLE, module: RemoteModule) -> Result<Vec<u8>> {
@@ -1011,172 +1027,40 @@ unsafe fn snapshot_remote_module(process: HANDLE, module: RemoteModule) -> Resul
     Ok(image)
 }
 
-unsafe fn find_remote_hid_thread(
+fn find_remote_hid_thread(
     process: HANDLE,
     process_id: u32,
     steamclient: RemoteModule,
     layout: RecoveryLayout,
 ) -> Result<usize> {
-    let primary = steamclient.base + layout.primary_vtable_rva as usize;
-    let secondary = steamclient.base + layout.secondary_vtable_rva as usize;
-    let pair_size = layout.secondary_object_offset as usize + size_of::<usize>();
-
-    let mut candidates = Vec::new();
-    let mut buffer = vec![0u8; PROCESS_SCAN_CHUNK];
-    let mut address = 0x1_0000usize;
-    while address < usize::MAX / 2 {
-        let mut memory: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
-        if unsafe {
-            VirtualQueryEx(
-                process,
-                address as *const c_void,
-                &mut memory,
-                size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        } == 0
-        {
-            break;
-        }
-        let region_start = memory.BaseAddress as usize;
-        let region_end = region_start.saturating_add(memory.RegionSize);
-        if memory_is_readable(memory.State, memory.Protect) && memory.Type == MEM_PRIVATE {
-            let mut chunk_start = region_start;
-            while chunk_start < region_end {
-                let chunk_end = chunk_start
-                    .saturating_add(PROCESS_SCAN_CHUNK)
-                    .min(region_end);
-                let length = chunk_end - chunk_start;
-                let mut transferred = 0;
-                // A partial copy returns FALSE with `transferred` still set, and those
-                // bytes are as valid as a full read's, so the result is not a gate.
-                let _ = unsafe {
-                    ReadProcessMemory(
-                        process,
-                        chunk_start as *const c_void,
-                        buffer.as_mut_ptr().cast(),
-                        length,
-                        &mut transferred,
-                    )
-                };
-                // Never trust the count past the request; slicing beyond the buffer would
-                // panic, which inside Steam is a crash.
-                let transferred = transferred.min(length);
-                // Only the bytes this read actually delivered may be
-                // matched. Everything past `transferred` is still the
-                // previous chunk's contents, and a candidate manufactured
-                // from that stale data would be an address this code later
-                // hands to WriteProcessMemory inside Steam.
-                candidates.extend(find_vtable_pairs(
-                    &buffer[..transferred],
-                    chunk_start,
-                    primary,
-                    secondary,
-                    layout.secondary_object_offset as usize,
-                ));
-                // ReadProcessMemory reports a partial copy as failure but still sets
-                // `transferred`, so those bytes were matched above; continue past the
-                // unreadable page rather than skipping the rest of the chunk.
-                match steam_input_recovery::next_scan_start(
-                    chunk_start,
-                    chunk_end,
-                    region_end,
-                    transferred,
-                    pair_size.saturating_sub(1),
-                ) {
-                    Some(next) => chunk_start = next,
-                    None => break,
-                }
-            }
-        }
-        if region_end <= address {
-            break;
-        }
-        address = region_end;
-    }
-
-    candidates.retain(|&candidate| unsafe {
-        hid_thread_is_live(
-            process,
-            candidate,
-            primary,
-            secondary,
-            layout.secondary_object_offset as usize,
-            layout.discovery_deadline_offset as usize,
-        )
-    });
-    candidates.sort_unstable();
-    candidates.dedup();
+    let memory = RemoteMemory(process);
+    let candidates = find_live_hid_threads(&memory, steamclient.base, &layout);
     match candidates.as_slice() {
         [candidate] => Ok(*candidate),
         [] => Err(Error::UnsupportedSteamBuild(
             "runtime RTTI resolved, but Steam's live CHIDIOThread object was not found".into(),
         )),
-        _ => unsafe { elect_running_hid_thread(process, process_id, &candidates, layout) },
+        // The nudge is the same device-change notification the payload uses as
+        // its compatibility fallback. Nothing is written to Steam during the
+        // election, and one that stays ambiguous fails closed.
+        _ => match elect_running_hid_thread(&memory, &layout, &candidates, || {
+            notify_device_change(process_id)
+        }) {
+            Election::Elected(index) => Ok(candidates[index]),
+            Election::Unreadable => Err(unreadable_candidates(&candidates)),
+            // The election gave up. Embed each candidate's first→last scheduler reading
+            // so wsgm.log distinguishes the two failure modes without a debugger: all
+            // "still" means the rebuilt HID thread had not resumed discovery inside the
+            // window (a timing problem), while two or more "MOVED" means genuinely live
+            // look-alikes that these two fields cannot separate (needs another field).
+            // Without a second observation, the last reading is the first one.
+            Election::Ambiguous { before, last } => Err(ambiguous_candidates(
+                &candidates,
+                &before,
+                last.as_deref().unwrap_or(&before),
+            )),
+        },
     }
-}
-
-/// Separates the running HID thread from abandoned look-alikes by watching
-/// which candidate keeps scheduling discovery.
-///
-/// Closing Steam's HID handles makes it tear its HID thread down and build a
-/// new one, and the freed block keeps the class vtables and a plausible
-/// deadline until the allocator hands that memory out again. Structural checks
-/// cannot tell the two apart because the abandoned copy is byte-for-byte a
-/// valid object; only the live one still moves.
-///
-/// Steam is nudged with the same device-change notification the payload uses as
-/// its compatibility fallback, so the running thread is given a reason to
-/// reschedule instead of leaving this to a quiet moment. Nothing is written to
-/// Steam here, and an election that stays ambiguous returns the same
-/// fail-closed error as before.
-unsafe fn elect_running_hid_thread(
-    process: HANDLE,
-    process_id: u32,
-    candidates: &[usize],
-    layout: RecoveryLayout,
-) -> Result<usize> {
-    let deadline_offset = layout.discovery_deadline_offset as usize;
-    let counter_offset = layout.discovery_counter_offset as usize;
-    match elect_progressing_candidate(
-        || unsafe { sample_candidates(process, candidates, deadline_offset, counter_offset) },
-        || notify_device_change(process_id),
-    ) {
-        Election::Elected(index) => Ok(candidates[index]),
-        Election::Unreadable => Err(unreadable_candidates(candidates)),
-        // The election gave up. Embed each candidate's first→last scheduler reading
-        // so wsgm.log distinguishes the two failure modes without a debugger: all
-        // "still" means the rebuilt HID thread had not resumed discovery inside the
-        // window (a timing problem), while two or more "MOVED" means genuinely live
-        // look-alikes that these two fields cannot separate (needs another field).
-        // Without a second observation, the last reading is the first one.
-        Election::Ambiguous { before, last } => Err(ambiguous_candidates(
-            candidates,
-            &before,
-            last.as_deref().unwrap_or(&before),
-        )),
-    }
-}
-
-/// Reads the scheduler fields of every candidate. A candidate that cannot be
-/// read at all abandons the election: an unreadable address must never be
-/// treated as a candidate that merely stood still.
-unsafe fn sample_candidates(
-    process: HANDLE,
-    candidates: &[usize],
-    deadline_offset: usize,
-    counter_offset: usize,
-) -> Option<Vec<SchedulerSample>> {
-    candidates
-        .iter()
-        .map(|&candidate| unsafe {
-            Some(SchedulerSample {
-                deadline_bits: read_remote::<f64>(process, candidate + deadline_offset)
-                    .ok()?
-                    .to_bits(),
-                counter: read_remote::<u32>(process, candidate + counter_offset).ok()?,
-            })
-        })
-        .collect()
 }
 
 fn ambiguous_candidates(
@@ -1278,11 +1162,8 @@ fn resolve_remote_recovery(process_id: u32) -> Result<RemoteRecoveryTarget> {
         Ok(RemoteRecoveryTarget {
             process,
             hid_thread,
-            deadline_offset: layout.discovery_deadline_offset as usize,
-            counter_offset: layout.discovery_counter_offset as usize,
-            primary_vtable: steamclient.base + layout.primary_vtable_rva as usize,
-            secondary_vtable: steamclient.base + layout.secondary_vtable_rva as usize,
-            secondary_object_offset: layout.secondary_object_offset as usize,
+            module_base: steamclient.base,
+            layout,
         })
     }
 }
@@ -1296,23 +1177,19 @@ fn request_internal_scan(target: &RemoteRecoveryTarget) -> Result<RescanResult> 
             "Steam's CHIDIOThread object is no longer valid at the resolved address".into(),
         ));
     }
+    let deadline = target.hid_thread + target.layout.discovery_deadline_offset as usize;
+    let counter = target.hid_thread + target.layout.discovery_counter_offset as usize;
     unsafe {
         let mut result = RescanResult {
-            previous_deadline: read_remote(
-                target.process.raw(),
-                target.hid_thread + target.deadline_offset,
-            )?,
-            scan_count_before: read_remote(
-                target.process.raw(),
-                target.hid_thread + target.counter_offset,
-            )?,
+            previous_deadline: read_remote(target.process.raw(), deadline)?,
+            scan_count_before: read_remote(target.process.raw(), counter)?,
             scan_count_after: 0,
         };
         let schedule = -1.0f64;
         let mut transferred = 0;
         if WriteProcessMemory(
             target.process.raw(),
-            (target.hid_thread + target.deadline_offset) as *mut c_void,
+            deadline as *mut c_void,
             (&schedule as *const f64).cast(),
             size_of::<f64>(),
             &mut transferred,
@@ -1323,12 +1200,9 @@ fn request_internal_scan(target: &RemoteRecoveryTarget) -> Result<RescanResult> 
                 "could not request Steam controller discovery",
             ));
         }
-        thread::sleep(Duration::from_millis(2200));
-        result.scan_count_after = read_remote(
-            target.process.raw(),
-            target.hid_thread + target.counter_offset,
-        )
-        .unwrap_or(result.scan_count_before);
+        thread::sleep(SECOND_DISCOVERY_DELAY);
+        result.scan_count_after =
+            read_remote(target.process.raw(), counter).unwrap_or(result.scan_count_before);
         Ok(result)
     }
 }

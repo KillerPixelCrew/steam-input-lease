@@ -101,7 +101,8 @@ impl From<RescanResult> for SilRescanResult {
     }
 }
 
-/// Controller recovery did not apply: the target is not Steam.
+/// Controller recovery did not apply: the target is not Steam, or other block
+/// leases remain.
 pub const SIL_RECOVERY_NOT_REQUIRED: u32 = 0;
 /// The payload scheduled discovery on its own timer.
 pub const SIL_RECOVERY_SCHEDULED: u32 = 1;

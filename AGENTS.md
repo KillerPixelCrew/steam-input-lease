@@ -184,3 +184,8 @@ with a functional change.
 
 Build outputs under `target/`, `artifacts/`, and managed `bin/` or `obj/` directories are generated
 and must not be committed.
+
+## Contributor skill
+
+Use `.agents/skills/steam-input-lease/SKILL.md` for implementation and review here, including code
+conventions, dispatch outcomes and lifecycle checks. Read nearer family/domain guidance as well.
